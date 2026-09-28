@@ -146,36 +146,43 @@ jobs:
         pm2 save
         echo "ACTIVE_BOTS=${BOT_LIST:-No bots found!}" >> $GITHUB_ENV
 
-    # --- 🌐 WEB PANELS (now password protected) ---
-    - name: 🌐 Start Web Panels & Btop
+    # --- 🌐 WEB PANELS: File Manager + Btop + Web Terminal (all password protected) ---
+    - name: 🌐 Start Web Panels, Terminal & Btop
       env:
         PANEL_PASS: ${{ secrets.SSH_PASSWORD }}
       run: |
         set +e
 
-        # File Browser with login (admin / SSH_PASSWORD). Password min 12 characters.
+        # 1) File Browser (login: admin / SSH_PASSWORD, min 12 characters)
         filebrowser config init -d /tmp/filebrowser.db > /tmp/fb_init.log 2>&1
         filebrowser users add admin "$PANEL_PASS" --perm.admin -d /tmp/filebrowser.db >> /tmp/fb_init.log 2>&1
+        cat /tmp/fb_init.log
         filebrowser -a 0.0.0.0 -p 8080 -r . -d /tmp/filebrowser.db > /tmp/filebrowser.log 2>&1 &
 
-        # btop read-only + login (admin / SSH_PASSWORD)
+        # 2) Btop (read-only, login: admin / SSH_PASSWORD)
         ttyd -R -c "admin:$PANEL_PASS" -p 61208 btop > /tmp/btop.log 2>&1 &
 
-        sleep 20
+        # 3) Web Terminal (full shell in browser, login: admin / SSH_PASSWORD)
+        ttyd -W -c "admin:$PANEL_PASS" -p 7681 bash > /tmp/term.log 2>&1 &
+
+        sleep 15
 
         cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_file.log 2>&1 &
         cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_btop.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf_term.log 2>&1 &
 
-        sleep 30
+        sleep 35
 
         FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_file.log | head -n 1)
         BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_btop.log | head -n 1)
+        TERM_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_term.log | head -n 1)
 
         echo "FILE_MANAGER_URL=${FILE_URL:-Wait and Refresh}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-Wait and Refresh}" >> $GITHUB_ENV
+        echo "TERM_URL=${TERM_URL:-Wait and Refresh}" >> $GITHUB_ENV
 
-    # --- 🔄 TMATE SSH & DISCORD ALERT (FIXED) ---
-    - name: 🔄 Start Tmate Loop & Discord Alert
+    # --- 🔄 DISCORD ALERT (tmate optional) + KEEP ALIVE ---
+    - name: 🔄 Discord Alert & Keep Alive
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       run: |
@@ -183,39 +190,52 @@ jobs:
 
         # Webhook URL se space/newline hata do
         WEBHOOK=$(printf '%s' "$DISCORD_WEBHOOK" | tr -d '[:space:]')
-        if [ -z "$WEBHOOK" ]; then
-          echo "❌ DISCORD_WEBHOOK secret khaali hai!"
+        [ -z "$WEBHOOK" ] && echo "❌ DISCORD_WEBHOOK secret khaali hai!"
+
+        # Prompt look
+        echo "export PS1='\[\033[01;32m\]VPS:\[\033[01;34m\]\W \[\033[01;32m\]❯ \[\033[00m\] '" >> ~/.bashrc
+        echo "set -g status off" > ~/.tmate.conf
+
+        # ---- Network diagnostics (log mein dikhega) ----
+        tmate -V
+        timeout 10 bash -c 'cat < /dev/null > /dev/tcp/ssh.tmate.io/22' && echo "✅ port 22 OK" || echo "🚫 port 22 BLOCKED"
+
+        # ---- Tmate (optional): sirf 3 koshish, phir aage badho ----
+        SSH_MSG=""
+        for i in 1 2 3; do
+          echo "🔁 Tmate attempt $i"
+          tmate -S /tmp/tmate.sock kill-server 2>/dev/null || true
+          tmate -S /tmp/tmate.sock new-session -d
+          if timeout 40 tmate -S /tmp/tmate.sock wait tmate-ready; then
+            SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
+            echo "SSH_MSG=$SSH_MSG"
+            [[ "$SSH_MSG" == *"tmate.io"* ]] && break
+          else
+            echo "⚠️ tmate ready nahi hua"
+            tmate -S /tmp/tmate.sock show-messages 2>&1 | tail -n 5
+          fi
+          SSH_MSG=""
+          sleep 5
+        done
+
+        if [ -n "$SSH_MSG" ]; then
+          SSH_LINE="💻 **SSH:** \`${SSH_MSG}\`"
+        else
+          SSH_LINE="💻 **SSH:** ❌ unavailable, neeche wala Web Terminal use karo"
         fi
 
-        # tmate config (session banne se PEHLE likhna zaroori hai)
-        echo "set -g status off" > ~/.tmate.conf
-        echo "set-option -g default-command \"export PS1='\[\033[01;32m\]Virtual Private Server \[\033[01;34m\]❯ \[\033[00m\] '; bash\"" >> ~/.tmate.conf
-        echo "export PS1='\[\033[01;32m\]VPS:\[\033[01;34m\]\$(echo \W | sed \"s/reimagined-octo-disco/Main-Root/\") \[\033[01;32m\]❯ \[\033[00m\] '" >> ~/.bashrc
-
-        for i in {1..15}; do
-           echo "🔁 Tmate attempt $i"
-           tmate -S /tmp/tmate.sock kill-server 2>/dev/null || true
-           tmate -S /tmp/tmate.sock new-session -d
-
-           # 60 sec se zyada wait nahi karega (pehle yahin atak jata tha)
-           timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready || { echo "⚠️ tmate ready nahi hua, retry..."; sleep 5; continue; }
-
-           SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
-           echo "SSH_MSG=$SSH_MSG"
-
-           if [[ "$SSH_MSG" == *"tmate.io"* ]]; then
-
-              # Message 2000 characters se chhota rakha hai (Discord limit)
-              MSG=$(cat <<EOF
+        # ---- Discord message (2000 character limit ke andar) ----
+        MSG=$(cat <<EOF
         ✨ **VPS Dashboard 02** ✨
 
         ✅ **Status:** \`Online\` 🟢
         🤖 **Active Bots:** \`${ACTIVE_BOTS}\`
 
+        🖥️ **Web Terminal:** ${TERM_URL}
         📂 **File Manager:** ${FILE_MANAGER_URL}
         📊 **VPS Health:** ${BTOP_URL}
-        🔑 **Panel Login:** \`admin\` / SSH_PASSWORD secret
-        💻 **SSH:** \`${SSH_MSG}\`
+        🔑 **Login:** \`admin\` / SSH_PASSWORD secret
+        ${SSH_LINE}
 
         🛠️ **Commands**
         💾 \`savecode\` → GitHub par save (session khatam hone se pehle zaroor)
@@ -228,25 +248,20 @@ jobs:
 
         💡 Help: https://wa.me/918434573266
         EOF
-              )
+        )
 
-              PAYLOAD=$(jq -n --arg content "$MSG" '{content: $content}')
+        PAYLOAD=$(jq -n --arg content "$MSG" '{content: $content}')
 
-              # HTTP code print hoga: 204 = success, 404/401 = webhook galat, 400 = message issue
-              curl -sS -w "\nDiscord HTTP: %{http_code}\n" -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+        # 204 = success, 404/401 = webhook galat, 400 = message issue
+        curl -sS -w "\nDiscord HTTP: %{http_code}\n" -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
 
-              echo "RESTART_SAFE=true" >> $GITHUB_ENV
+        echo "RESTART_SAFE=true" >> $GITHUB_ENV
 
-              for m in {1..36}; do sleep 300; done
+        # ---- Keep alive ~3 ghante, phir auto-save ----
+        for m in {1..36}; do sleep 300; done
 
-              savecode || true
-              exit 0
-           fi
-           sleep 5
-        done
-
-        curl -sS -w "\nDiscord HTTP: %{http_code}\n" -H "Content-Type: application/json" -d '{"content": "❌ **ERROR:** Tmate Server failed. Auto-restart paused."}' "$WEBHOOK"
-        exit 1
+        savecode || true
+        exit 0
 
     - name: 🧟 Respawn Zombie
       if: env.RESTART_SAFE == 'true'
