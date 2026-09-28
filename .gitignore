@@ -3,3 +3,8 @@
 filebrowser.db
 cookies.txt
 __pycache__/
+**/node_modules/
+**/*.log
+filebrowser.db
+cookies.txt
+__pycache__/
