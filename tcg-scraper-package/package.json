@@ -1,0 +1,14 @@
+{
+  "name": "pokemon-tcg-scraper",
+  "version": "1.0.0",
+  "description": "Fetch complete Pokemon TCG card data (all sets) + download high-res images, for Marin MD integration",
+  "main": "fetchAllFromApi.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "fetch": "node fetchAllFromApi.js",
+    "fetch:test": "node fetchAllFromApi.js --set me55",
+    "images": "node downloadAllImages.js",
+    "images:test": "node downloadAllImages.js --set me55"
+  },
+  "dependencies": {}
+}
