@@ -44,7 +44,7 @@ jobs:
         sudo docker image prune --all --force
 
         sudo apt-get update -qq
-        sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate neofetch ttyd btop python3 python3-pip
+        sudo apt-get install -y -qq ffmpeg imagemagick webp jq neofetch ttyd btop nano python3 python3-pip
 
         # --- 📥 YT-DLP + JS RUNTIME FIX ---
         sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
@@ -66,7 +66,6 @@ jobs:
 
         sudo npm install -g pm2
         curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | sudo bash
-        ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 
     - name: 💾 Setup Ghost Auto-Save (savecode)
       run: |
@@ -78,6 +77,7 @@ jobs:
         echo "**/*.log" >> .gitignore
         echo "filebrowser.db" >> .gitignore
         echo "cookies.txt" >> .gitignore
+        echo "__pycache__/" >> .gitignore
 
         mv .github /tmp/.github_hidden
 
@@ -146,42 +146,53 @@ jobs:
         pm2 save
         echo "ACTIVE_BOTS=${BOT_LIST:-No bots found!}" >> $GITHUB_ENV
 
-    # --- 🌐 WEB PANELS: File Manager + Btop + Web Terminal (all password protected) ---
-    - name: 🌐 Start Web Panels, Terminal & Btop
+    # --- 🌐 WEB PANELS: Terminal + File Manager + Btop (all password protected) ---
+    - name: 🌐 Start Terminal, File Manager & Btop
       env:
         PANEL_PASS: ${{ secrets.SSH_PASSWORD }}
       run: |
         set +e
 
-        # 1) File Browser (login: admin / SSH_PASSWORD, min 12 characters)
+        # 1) MAIN TERMINAL: asli PTY terminal + typing box (webterm.py repo ke root mein honi chahiye)
+        if [ -f webterm.py ]; then
+          nohup python3 -u webterm.py > /tmp/webterm.log 2>&1 &
+        else
+          echo "❌ webterm.py repo ke root mein nahi mili!"
+        fi
+
+        # 2) BACKUP TERMINAL: ttyd (classic), port 7682
+        env -u PANEL_PASS ttyd -W -c "admin:$PANEL_PASS" -p 7682 /bin/bash -l > /tmp/ttyd_term.log 2>&1 &
+
+        # 3) File Browser (login: admin / SSH_PASSWORD, min 12 characters)
         filebrowser config init -d /tmp/filebrowser.db > /tmp/fb_init.log 2>&1
         filebrowser users add admin "$PANEL_PASS" --perm.admin -d /tmp/filebrowser.db >> /tmp/fb_init.log 2>&1
         cat /tmp/fb_init.log
         filebrowser -a 0.0.0.0 -p 8080 -r . -d /tmp/filebrowser.db > /tmp/filebrowser.log 2>&1 &
 
-        # 2) Btop (read-only, login: admin / SSH_PASSWORD)
+        # 4) Btop (read-only, login: admin / SSH_PASSWORD)
         ttyd -R -c "admin:$PANEL_PASS" -p 61208 btop > /tmp/btop.log 2>&1 &
 
-        # 3) Web Terminal (full shell in browser, login: admin / SSH_PASSWORD)
-        ttyd -W -c "admin:$PANEL_PASS" -p 7681 bash > /tmp/term.log 2>&1 &
-
         sleep 15
+        echo "--- webterm log:"; cat /tmp/webterm.log
 
+        cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf_term.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:7682 > /tmp/cf_term2.log 2>&1 &
         cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_file.log 2>&1 &
         cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_btop.log 2>&1 &
-        cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf_term.log 2>&1 &
 
-        sleep 35
+        sleep 40
 
+        TERM_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_term.log | head -n 1)
+        TERM2_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_term2.log | head -n 1)
         FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_file.log | head -n 1)
         BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_btop.log | head -n 1)
-        TERM_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_term.log | head -n 1)
 
+        echo "TERM_URL=${TERM_URL:-Wait and Refresh}" >> $GITHUB_ENV
+        echo "TERM2_URL=${TERM2_URL:-Wait and Refresh}" >> $GITHUB_ENV
         echo "FILE_MANAGER_URL=${FILE_URL:-Wait and Refresh}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-Wait and Refresh}" >> $GITHUB_ENV
-        echo "TERM_URL=${TERM_URL:-Wait and Refresh}" >> $GITHUB_ENV
 
-    # --- 🔄 DISCORD ALERT (tmate optional) + KEEP ALIVE ---
+    # --- 🔄 DISCORD ALERT + KEEP ALIVE ---
     - name: 🔄 Discord Alert & Keep Alive
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -192,38 +203,6 @@ jobs:
         WEBHOOK=$(printf '%s' "$DISCORD_WEBHOOK" | tr -d '[:space:]')
         [ -z "$WEBHOOK" ] && echo "❌ DISCORD_WEBHOOK secret khaali hai!"
 
-        # Prompt look
-        echo "export PS1='\[\033[01;32m\]VPS:\[\033[01;34m\]\W \[\033[01;32m\]❯ \[\033[00m\] '" >> ~/.bashrc
-        echo "set -g status off" > ~/.tmate.conf
-
-        # ---- Network diagnostics (log mein dikhega) ----
-        tmate -V
-        timeout 10 bash -c 'cat < /dev/null > /dev/tcp/ssh.tmate.io/22' && echo "✅ port 22 OK" || echo "🚫 port 22 BLOCKED"
-
-        # ---- Tmate (optional): sirf 3 koshish, phir aage badho ----
-        SSH_MSG=""
-        for i in 1 2 3; do
-          echo "🔁 Tmate attempt $i"
-          tmate -S /tmp/tmate.sock kill-server 2>/dev/null || true
-          tmate -S /tmp/tmate.sock new-session -d
-          if timeout 40 tmate -S /tmp/tmate.sock wait tmate-ready; then
-            SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
-            echo "SSH_MSG=$SSH_MSG"
-            [[ "$SSH_MSG" == *"tmate.io"* ]] && break
-          else
-            echo "⚠️ tmate ready nahi hua"
-            tmate -S /tmp/tmate.sock show-messages 2>&1 | tail -n 5
-          fi
-          SSH_MSG=""
-          sleep 5
-        done
-
-        if [ -n "$SSH_MSG" ]; then
-          SSH_LINE="💻 **SSH:** \`${SSH_MSG}\`"
-        else
-          SSH_LINE="💻 **SSH:** ❌ unavailable, neeche wala Web Terminal use karo"
-        fi
-
         # ---- Discord message (2000 character limit ke andar) ----
         MSG=$(cat <<EOF
         ✨ **VPS Dashboard 02** ✨
@@ -231,11 +210,11 @@ jobs:
         ✅ **Status:** \`Online\` 🟢
         🤖 **Active Bots:** \`${ACTIVE_BOTS}\`
 
-        🖥️ **Web Terminal:** ${TERM_URL}
+        ⌨️ **Terminal:** ${TERM_URL}
+        🛟 **Backup Terminal:** ${TERM2_URL}
         📂 **File Manager:** ${FILE_MANAGER_URL}
         📊 **VPS Health:** ${BTOP_URL}
-        🔑 **Login:** \`admin\` / SSH_PASSWORD secret
-        ${SSH_LINE}
+        🔑 **Login (sab par):** \`admin\` / SSH_PASSWORD secret
 
         🛠️ **Commands**
         💾 \`savecode\` → GitHub par save (session khatam hone se pehle zaroor)
