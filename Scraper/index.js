@@ -214,7 +214,7 @@ async function scrapeDetail(page, url) {
 
 async function scrapeShoobCards() {
     let output;
-    let pageNum = 188;
+    let pageNum = 1;
     let totalCardsExtracted = 0;
     let failedCards = 0;
     let isFirstCard = true;
