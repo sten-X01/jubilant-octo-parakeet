@@ -1,17 +1,17 @@
-
 const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 const { once } = require('events');
 
+const SCRAPE_EVENTS = true;
 const BASE_URL = 'https://shoob.gg';
-const OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
+const NORMAL_OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
 
 const CONCURRENCY = 5;
 const PAGES_PER_SESSION = 10;
-const PAGE_TIMEOUT = 35000;
-const SELECTOR_TIMEOUT = 12000;
+const PAGE_TIMEOUT = 45000;
+const SELECTOR_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 500;
 
@@ -22,7 +22,7 @@ function absoluteUrl(url) {
     try {
         return new URL(url, BASE_URL).href;
     } catch {
-        return url;
+        return null;
     }
 }
 
@@ -38,18 +38,20 @@ async function optimizePage(page) {
     await page.setRequestInterception(true);
 
     page.on('request', request => {
+        if (request.isInterceptResolutionHandled()) return;
         const type = request.resourceType();
-        if (['image', 'media', 'font'].includes(type)) {
+
+        if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
             request.abort().catch(() => {});
-            return;
+        } else {
+            request.continue().catch(() => {});
         }
-        request.continue().catch(() => {});
     });
 }
 
 async function launchBrowser() {
     return puppeteer.launch({
-        headless: true,
+        headless: 'new',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -57,9 +59,86 @@ async function launchBrowser() {
             '--disable-background-networking',
             '--disable-extensions',
             '--disable-sync',
-            '--disable-default-apps'
+            '--disable-default-apps',
+            '--js-flags=--max-old-space-size=256'
         ]
     });
+}
+
+async function getEventTargets() {
+    console.log('\n[INFO] Fetching active events...');
+    let browser;
+
+    try {
+        browser = await launchBrowser();
+        const page = await browser.newPage();
+        await optimizePage(page);
+
+        await page.goto(`${BASE_URL}/card-events`, {
+            waitUntil: 'networkidle2',
+            timeout: PAGE_TIMEOUT
+        });
+
+        try {
+            await page.waitForSelector('a[href^="/card-events/"]', {
+                timeout: SELECTOR_TIMEOUT
+            });
+            await delay(1000);
+        } catch {
+            console.log('[WARNING] Event links were not detected.');
+        }
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+        const eventSlugs = [];
+
+        $('a[href^="/card-events/"]').each((i, el) => {
+            const href = $(el).attr('href');
+            if (!href) return;
+
+            try {
+                const pathname = new URL(href, BASE_URL).pathname;
+                const parts = pathname.split('/').filter(Boolean);
+
+                if (
+                    parts.length === 2 &&
+                    parts[0] === 'card-events' &&
+                    /^[a-zA-Z0-9_-]+$/.test(parts[1])
+                ) {
+                    eventSlugs.push(parts[1]);
+                }
+            } catch {}
+        });
+
+        console.log(`[INFO] Found ${eventSlugs.length} event link occurrences.`);
+
+        const slugCounts = {};
+
+        return eventSlugs.map(slug => {
+            slugCounts[slug] = (slugCounts[slug] || 0) + 1;
+
+            const occurrence = slugCounts[slug];
+            const suffix = occurrence > 1 ? `-${occurrence}` : '';
+
+            return {
+                baseUrl: `${BASE_URL}/card-events/${slug}`,
+                outputFile: path.join(
+                    __dirname,
+                    `Shoob-Event-${slug}${suffix}.json`
+                ),
+                name: `Event: ${slug} (Occurrence ${occurrence})`
+            };
+        });
+    } catch (error) {
+        console.error(`[EVENT DISCOVERY ERROR] ${error.message}`);
+        return [];
+    } finally {
+        if (browser) {
+            await browser.close().catch(error => {
+                console.error(`[EVENT BROWSER CLOSE] ${error.message}`);
+            });
+        }
+    }
 }
 
 function extractCardData(html, cardDetailUrl) {
@@ -82,10 +161,15 @@ function extractCardData(html, cardDetailUrl) {
         cardData.tier = 'Unknown';
     }
 
-    let seriesName = $('.page-breadcrumb li').eq(2).text().trim();
-    if (!seriesName) seriesName = $('.fff').first().text().trim();
+    if (cardDetailUrl.includes('/card-events/')) {
+        cardData.eventName = $('.page-breadcrumb li').eq(2).text().trim();
+        cardData.series = $('.fff').first().text().trim() || 'Event Exclusive';
+    } else {
+        let seriesName = $('.page-breadcrumb li').eq(2).text().trim();
+        if (!seriesName) seriesName = $('.fff').first().text().trim();
+        cardData.series = seriesName;
+    }
 
-    cardData.series = seriesName;
     cardData.sourceUrl = cardDetailUrl;
 
     const mainCardNode = $('.cardData').first();
@@ -173,13 +257,15 @@ async function scrapeDetail(page, url) {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
             await page.goto(url, {
-                waitUntil: 'domcontentloaded',
+                waitUntil: 'networkidle2',
                 timeout: PAGE_TIMEOUT
             });
 
             await page.waitForSelector('.cardData', {
                 timeout: SELECTOR_TIMEOUT
             });
+
+            await delay(800);
 
             return extractCardData(await page.content(), url);
         } catch (error) {
@@ -212,26 +298,19 @@ async function scrapeDetail(page, url) {
     };
 }
 
-async function scrapeShoobCards() {
+async function scrapeTarget(target) {
+    console.log(`\n>>>>>>>> STARTING TARGET: ${target.name} <<<<<<<<\n`);
+
     let output;
     let pageNum = 1;
     let totalCardsExtracted = 0;
     let failedCards = 0;
     let isFirstCard = true;
     let finished = false;
-
-    console.log('\n======================================');
-    console.log('Shoob.gg Optimized Scraper');
-    console.log('======================================');
-    console.log(`Concurrency: ${CONCURRENCY}`);
-    console.log(`Browser Recycling: Every ${PAGES_PER_SESSION} Pages`);
-    console.log('Duplicate filtering: DISABLED');
-    console.log('Incomplete card filtering: DISABLED');
-    console.log('Media downloads: DISABLED');
-    console.log('======================================\n');
+    let fatalError = null;
 
     try {
-        output = fs.createWriteStream(OUTPUT_FILE, { encoding: 'utf8' });
+        output = fs.createWriteStream(target.outputFile, { encoding: 'utf8' });
         await once(output, 'open');
         await writeStream(output, '[\n');
 
@@ -240,11 +319,8 @@ async function scrapeShoobCards() {
             let sessionPagesCompleted = 0;
 
             try {
-                console.log('\n======================================');
-                console.log(`STARTING NEW BROWSER SESSION`);
-                console.log(`Starting Page: ${pageNum}`);
-                console.log(`Maximum Pages: ${PAGES_PER_SESSION}`);
-                console.log('======================================\n');
+                console.log(`\n[SESSION] ${target.name}`);
+                console.log(`[START PAGE] ${pageNum}`);
 
                 browser = await launchBrowser();
 
@@ -263,25 +339,32 @@ async function scrapeShoobCards() {
                     sessionPagesCompleted < PAGES_PER_SESSION &&
                     !finished
                 ) {
-                    const pageUrl = `${BASE_URL}/cards?page=${pageNum}`;
+                    const pageUrl = `${target.baseUrl}?page=${pageNum}`;
+
                     console.log(`\n[PAGE ${pageNum}] ${pageUrl}`);
 
                     let cardLinks = [];
 
                     try {
                         await listPage.goto(pageUrl, {
-                            waitUntil: 'domcontentloaded',
+                            waitUntil: 'networkidle2',
                             timeout: PAGE_TIMEOUT
                         });
 
-                        await listPage.waitForSelector(
-                            'a[href*="/cards/info/"]',
-                            { timeout: SELECTOR_TIMEOUT }
-                        );
+                        try {
+                            await listPage.waitForSelector('.card-main a', {
+                                timeout: SELECTOR_TIMEOUT
+                            });
+                            await delay(1000);
+                        } catch {
+                            console.log('[INFO] No cards found. Ending target.');
+                            finished = true;
+                            break;
+                        }
 
                         const $ = cheerio.load(await listPage.content());
 
-                        $('a[href*="/cards/info/"]').each((i, el) => {
+                        $('.card-main a').each((i, el) => {
                             const href = $(el).attr('href');
                             if (href) {
                                 const url = absoluteUrl(href);
@@ -290,17 +373,18 @@ async function scrapeShoobCards() {
                         });
                     } catch (error) {
                         console.error(`[PAGE ERROR] ${error.message}`);
+                        fatalError = error;
                         finished = true;
                         break;
                     }
 
                     if (!cardLinks.length) {
-                        console.log('No more card links found.');
+                        console.log('[INFO] No more card links.');
                         finished = true;
                         break;
                     }
 
-                    console.log(`Found ${cardLinks.length} card links.`);
+                    console.log(`[INFO] Found ${cardLinks.length} card link occurrences.`);
 
                     let nextIndex = 0;
 
@@ -317,13 +401,11 @@ async function scrapeShoobCards() {
                                 if (card.extractionFailed) failedCards++;
 
                                 const json = JSON.stringify(card, null, 2);
-
-                                await writeStream(
-                                    output,
-                                    (isFirstCard ? '' : ',\n') + json
-                                );
-
+                                const prefix = isFirstCard ? '' : ',\n';
                                 isFirstCard = false;
+
+                                await writeStream(output, prefix + json);
+
                                 totalCardsExtracted++;
 
                                 console.log(
@@ -347,33 +429,31 @@ async function scrapeShoobCards() {
                     pageNum++;
                     sessionPagesCompleted++;
                 }
+            } catch (error) {
+                console.error(`[SESSION ERROR] ${error.message}`);
+                fatalError = error;
+                finished = true;
             } finally {
                 if (browser) {
-                    console.log('\n======================================');
-                    console.log('CLOSING BROWSER SESSION');
-                    console.log(`Pages Completed: ${sessionPagesCompleted}`);
-                    console.log(`Next Page: ${pageNum}`);
-                    console.log('======================================');
+                    console.log('[RECYCLE] Closing Chromium...');
 
                     await browser.close().catch(error => {
-                        console.error('Browser close error:', error.message);
+                        console.error(`[BROWSER CLOSE ERROR] ${error.message}`);
                     });
 
                     browser = null;
+                    console.log('[RECYCLE] Chromium closed.');
                 }
             }
 
             if (!finished && sessionPagesCompleted === PAGES_PER_SESSION) {
-                console.log('\n======================================');
-                console.log('BROWSER RECYCLED SUCCESSFULLY');
-                console.log(`Completed Through Page: ${pageNum - 1}`);
-                console.log(`Resuming From Page: ${pageNum}`);
-                console.log('Launching Fresh Chromium...');
-                console.log('======================================\n');
+                console.log(`[RECYCLE] Completed through page ${pageNum - 1}.`);
+                console.log(`[RECYCLE] Resuming from page ${pageNum}.`);
             }
         }
     } catch (error) {
-        console.error('\n[FATAL ERROR]', error);
+        fatalError = error;
+        console.error(`[FATAL ERROR] ${target.name}: ${error.message}`);
     } finally {
         if (output) {
             try {
@@ -382,24 +462,65 @@ async function scrapeShoobCards() {
                 output.end();
                 await finishedEvent;
             } catch (error) {
-                console.error('Output write error:', error.message);
+                console.error(`[OUTPUT ERROR] ${error.message}`);
                 output.destroy();
             }
         }
 
         console.log('\n======================================');
-        console.log('SCRAPING FINISHED');
-        console.log('======================================');
+        console.log(`FINISHED TARGET: ${target.name}`);
         console.log(`Total entries: ${totalCardsExtracted}`);
         console.log(`Failed extractions: ${failedCards}`);
         console.log(`Last page reached: ${pageNum}`);
-        console.log(`Output: ${OUTPUT_FILE}`);
+        console.log(`Output File: ${target.outputFile}`);
+        if (fatalError) console.log(`Stopped due to: ${fatalError.message}`);
         console.log('Duplicate filtering: OFF');
         console.log('======================================\n');
     }
 }
 
-scrapeShoobCards().catch(error => {
-    console.error('Unexpected error:', error);
+async function mainScraperController() {
+    console.log('\n======================================');
+    console.log('Shoob.gg Universal Scraper');
+    console.log('======================================');
+    console.log(`Mode: ${SCRAPE_EVENTS ? 'EVENTS' : 'NORMAL CARDS'}`);
+    console.log(`Concurrency: ${CONCURRENCY} Tabs`);
+    console.log(`Browser Recycling: Every ${PAGES_PER_SESSION} Pages`);
+    console.log('Event duplicate filtering: OFF');
+    console.log('Card duplicate filtering: OFF');
+    console.log('Incomplete card filtering: OFF');
+    console.log('Media downloads: OFF');
+    console.log('======================================\n');
+
+    let targets = [];
+
+    if (SCRAPE_EVENTS) {
+        targets = await getEventTargets();
+
+        console.log(`[INFO] Loaded ${targets.length} event targets.`);
+
+        if (!targets.length) {
+            console.log('[INFO] No events found. Exiting.');
+            return;
+        }
+    } else {
+        targets = [{
+            baseUrl: `${BASE_URL}/cards`,
+            outputFile: NORMAL_OUTPUT_FILE,
+            name: 'Normal Database'
+        }];
+    }
+
+    for (const target of targets) {
+        await scrapeTarget(target);
+    }
+
+    console.log('\n======================================');
+    console.log('ALL SCRAPING TASKS COMPLETED');
+    console.log('======================================');
+}
+
+mainScraperController().catch(error => {
+    console.error('[UNEXPECTED ERROR]', error);
     process.exitCode = 1;
 });
