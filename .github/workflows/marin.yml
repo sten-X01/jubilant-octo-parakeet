@@ -23,12 +23,11 @@ env:
   RUN_MINUTES: '340'       # ek run ki length (GitHub hard limit = 360 min)
   AUTOSAVE_MINUTES: '30'   # har itne min me GitHub pe auto-save
   STATUS_MINUTES: '5'      # Discord status message refresh
-  BOT_MAX_MEM: '15'        # is se zyada RAM le to bot auto-restart
   PANEL_USER: admin        # File Manager / Monitor ka username
 
 jobs:
   ultimate-vps:
-    name: Marin VPS
+    name: 🌸 Marin VPS
     runs-on: ubuntu-24.04
     timeout-minutes: 355
 
@@ -362,6 +361,7 @@ jobs:
 
           . "$MH/env.sh"
           vps-notify boot "Runner ready (Init + helper commands)"
+          exit 0
 
     - name: 🟢 Setup Node.js
       uses: actions/setup-node@v6
@@ -450,8 +450,8 @@ jobs:
           } > /tmp/bashrc.new && mv /tmp/bashrc.new "$HOME/.bashrc"
           cat >> "$HOME/.bashrc" <<'MARIN_EOF'
 
-          # --- 🎀 Marin VPS ---
-          export PS1='\[\e[1;35m\] marin\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \[\e[1;32m\]❯\[\e[0m\] '
+          # --- 🌸 Marin VPS ---
+          export PS1='\[\e[1;35m\]🌸 marin\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \[\e[1;32m\]❯\[\e[0m\] '
           alias ll='ls -lah --color=auto'
           alias bd='cd "$MARIN_DIR"'
           alias bots='pm2 status'
@@ -470,6 +470,7 @@ jobs:
           echo "=== VERSIONS ==="
           node -v; bun -v; python3 -V; deno --version | head -n 1; ffmpeg -version | head -n 1
           yt-dlp --version; pm2 -v; tailscale version | head -n 1; filebrowser version; cloudflared --version
+          exit 0
 
     - name: 🚀 Start All Bots (PM2)
       run: |
@@ -480,7 +481,7 @@ jobs:
           ulimit -n 65535 2>/dev/null
           cd "$MARIN_DIR" || exit 1
 
-          PM2_OPTS="--time --max-memory-restart $BOT_MAX_MEM --restart-delay 3000"
+          PM2_OPTS="--time --restart-delay 3000"
           BOT_LIST=""; FAILED=""
 
           for dir in */ ; do
@@ -535,8 +536,13 @@ jobs:
           pm2 save
 
           echo "Active bots: ${BOT_LIST:-none}"
-          [ -n "$FAILED" ] && vps-notify event "⚠️ Dependency install fail" "Ye bots ke packages install nahi hue:\`$FAILED\`" yellow
-          [ -z "$BOT_LIST" ] && vps-notify event "ℹ️ Koi bot nahi mila" "Repo me \`package.json\` ya \`requirements.txt\` wala folder nahi hai." blue
+          if [ -n "$FAILED" ]; then
+            vps-notify event "⚠️ Dependency install fail" "Ye bots ke packages install nahi hue:\`$FAILED\`" yellow
+          fi
+          if [ -z "$BOT_LIST" ]; then
+            vps-notify event "ℹ️ Koi bot nahi mila" "Repo me \`package.json\` ya \`requirements.txt\` wala folder nahi hai." blue
+          fi
+          exit 0
 
     - name: 🌐 Network (SSH + Tailscale + Panels)
       env:
@@ -605,6 +611,7 @@ jobs:
             printf 'export TS_HOST=%q\n' "${TS_HOST:-marin-vps}"
             printf 'export PANEL_PASS_HINT=%q\n' "$PANEL_HINT"
           } > "$MH/state.env"
+          exit 0
 
     - name: 💚 Go Online + Keep-Alive
       env:
@@ -671,6 +678,7 @@ jobs:
             fi
           done
           echo "⏰ Session time pura hua."
+          exit 0
 
     - name: 💾 Final Save + Shutdown
       if: always()
@@ -697,6 +705,7 @@ jobs:
           fi
           vps-notify offline "$R"
           sudo tailscale logout > /dev/null 2>&1
+          exit 0
 
     - name: 🔁 Respawn Next Run
       if: ${{ !cancelled() && env.RESTART_SAFE == 'true' }}
