@@ -18,7 +18,7 @@ env:
 jobs:
   ultimate-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 350
 
     steps:
     - name: 📂 Checkout Code
@@ -169,12 +169,14 @@ jobs:
         echo "FILE_MANAGER_URL=${FILE_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
 
-    # --- 🔌 SSH VIA CLOUDFLARED ---
-    - name: 🔌 SSH via Cloudflared & Discord Alert
+    # --- 🔌 SSH VIA TAILSCALE ---
+    - name: 🔌 SSH via Tailscale & Discord Alert
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
       run: |
         set +e
+        RUN_MINUTES=330   # GitHub ka hard limit 360 min hai
 
         # --- sshd with password login ---
         sudo apt-get install -y -qq openssh-server
@@ -185,49 +187,37 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep ':22 ' && echo "sshd listening on 22" || echo "sshd NOT listening"
 
-        # --- Cloudflared SSH tunnel (auto-reconnect) ---
-        (
-          while true; do
-            cloudflared tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf_ssh.log 2>&1
-            sleep 3
-          done
-        ) &
+        # --- Tailscale ---
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=marin-vps --accept-dns=false
+        sleep 5
+        tailscale status
 
-        sleep 25
-        echo "=== CF SSH LOG ==="; tail -n 30 /tmp/cf_ssh.log
+        TS_IP=$(tailscale ip -4 2>/dev/null | head -n 1)
+        TS_HOST=$(tailscale status --json 2>/dev/null | jq -r '.Self.HostName // empty')
+        echo "Tailscale IP: ${TS_IP:-none} | Host: ${TS_HOST:-none}"
 
-        get_host() {
-          grep -o '[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_ssh.log 2>/dev/null | tail -n 1
-        }
-
-        send_alert() {
-          H="$1"
-          if [ -n "$H" ]; then
-            MSG="✅ **VPS Online**\n🤖 Bots: \`$ACTIVE_BOTS\`\n📂 Files: $FILE_MANAGER_URL\n📊 Health: $BTOP_URL\n\n💻 **SSH** (user: runner, pass: SSH_PASSWORD secret)\n\`ssh -o ProxyCommand=\"cloudflared access ssh --hostname $H\" runner@$H\`\n\n💾 Save: \`savecode\` (session khatam hone se pehle)"
-          else
-            MSG="⚠️ Cloudflared SSH URL nahi mila. Workflow logs check karo."
-          fi
-          PAYLOAD=$(jq -n --arg c "$(printf '%b' "$MSG")" '{content: $c}')
-          curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
-        }
-
-        LAST=$(get_host)
-        echo "SSH host: ${LAST:-none}"
-        send_alert "$LAST"
+        if [ -n "$TS_IP" ]; then
+          MSG="✅ **VPS Online**\n🤖 Bots: \`$ACTIVE_BOTS\`\n📂 Files: $FILE_MANAGER_URL\n📊 Health: $BTOP_URL\n\n💻 **SSH** (Tailscale ON hona chahiye)\n\`ssh runner@$TS_HOST\`\n\`ssh runner@$TS_IP\`\n🔑 Password: SSH_PASSWORD secret\n\n💾 Save: \`savecode\` (session khatam hone se pehle)"
+        else
+          MSG="⚠️ Tailscale connect nahi hua. TS_AUTHKEY check karo (expire/revoke?). Workflow logs dekho."
+        fi
+        PAYLOAD=$(jq -n --arg c "$(printf '%b' "$MSG")" '{content: $c}')
+        curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
 
         echo "RESTART_SAFE=true" >> $GITHUB_ENV
 
-        # ~3 hours; agar tunnel restart hua aur host badla to naya alert
-        for m in {1..180}; do
+        for ((m=1; m<=RUN_MINUTES; m++)); do
           sleep 60
-          NOW=$(get_host)
-          if [ -n "$NOW" ] && [ "$NOW" != "$LAST" ]; then
-            LAST="$NOW"
-            send_alert "$LAST"
+          # Tailscale beech me gir jaye to dobara up karo
+          if [ -z "$(tailscale ip -4 2>/dev/null | head -n 1)" ]; then
+            sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=marin-vps --accept-dns=false
           fi
         done
 
         savecode || true
+        # node turant hatao taaki naye run me 'marin-vps' naam wapas mile
+        sudo tailscale logout || true
         exit 0
 
     - name: 🧟 Respawn Zombie
