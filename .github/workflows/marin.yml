@@ -169,50 +169,38 @@ jobs:
         echo "FILE_MANAGER_URL=${FILE_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
 
-    # --- 🔍 TMATE DEBUG (temporary) ---
-    - name: 🔍 Tmate Debug
+    # --- 💻 WEB TERMINAL (tmate replacement) ---
+    - name: 💻 Web Terminal & Discord Alert
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
       run: |
         set +e
 
-        echo "=== DNS ==="
-        getent hosts ssh.tmate.io || echo "DNS FAIL"
+        echo "=== DNS CHECK ==="
+        getent hosts github.com || echo "github.com DNS FAIL"
+        getent hosts tmate.io || echo "tmate.io DNS FAIL"
 
-        echo "=== PORT CHECK ==="
-        timeout 5 bash -c '</dev/tcp/ssh.tmate.io/22' && echo "22 OK" || echo "22 BLOCKED"
-        timeout 5 bash -c '</dev/tcp/ssh.tmate.io/443' && echo "443 OK" || echo "443 BLOCKED"
+        # Password-protected browser terminal (user: runner, pass: SSH_PASSWORD)
+        ttyd -W -c "runner:${SSH_PASSWORD}" -p 7681 bash -l > /tmp/ttyd_shell.log 2>&1 &
+        sleep 5
 
-        echo "=== TMATE ==="
-        tmate -V
-        tmate -S /tmp/tmate.sock kill-server 2>/dev/null
-        rm -f /tmp/tmate.sock
-        tmate -S /tmp/tmate.sock new-session -d
-        timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready
-        echo "wait exit code: $?"
+        cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf_shell.log 2>&1 &
+        sleep 25
 
-        echo "=== MESSAGES ==="
-        tmate -S /tmp/tmate.sock show-messages
+        TERM_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_shell.log | head -n 1)
+        echo "Terminal URL: ${TERM_URL:-NOT FOUND}"
 
-        echo "=== SSH STRING ==="
-        SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
-        echo "$SSH_MSG"
+        PAYLOAD=$(jq -n \
+          --arg term "${TERM_URL:-not found}" \
+          --arg fileUrl "$FILE_MANAGER_URL" \
+          --arg btopUrl "$BTOP_URL" \
+          --arg bots "$ACTIVE_BOTS" \
+          '{content: "✅ **VPS Online**\n🤖 Bots: `\($bots)`\n📂 Files: \($fileUrl)\n📊 Health: \($btopUrl)\n💻 Terminal: \($term)\n🔑 Login: user `runner` + SSH_PASSWORD secret\n\n💾 Save: `savecode` (session khatam hone se pehle)"}')
+        curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
 
-        # Agar SSH mil gaya to Discord pe bhej do
-        if [[ "$SSH_MSG" == *"tmate.io"* ]]; then
-          PAYLOAD=$(jq -n \
-            --arg ssh "$SSH_MSG" \
-            --arg fileUrl "$FILE_MANAGER_URL" \
-            --arg btopUrl "$BTOP_URL" \
-            --arg bots "$ACTIVE_BOTS" \
-            '{content: "✅ **VPS Online**\n🤖 Bots: `\($bots)`\n📂 Files: \($fileUrl)\n📊 Health: \($btopUrl)\n💻 SSH: `\($ssh)`\n\n💾 Save: `savecode`"}')
-          curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
-        fi
-
-        # Runner 30 min zinda rakho taaki bots + panels chalte rahein aur log padh sako.
-        # Jab debug khatam ho jaye to Cancel workflow kar do.
         echo "RESTART_SAFE=true" >> $GITHUB_ENV
-        for m in {1..6}; do sleep 300; done
+        for m in {1..36}; do sleep 300; done
         savecode || true
         exit 0
 
