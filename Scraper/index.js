@@ -8,7 +8,7 @@ const { once } = require('events');
 const BASE_URL = 'https://shoob.gg';
 const OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
 
-const CONCURRENCY = 10;
+const CONCURRENCY = 5;
 const PAGES_PER_SESSION = 10;
 const PAGE_TIMEOUT = 35000;
 const SELECTOR_TIMEOUT = 12000;
@@ -214,7 +214,7 @@ async function scrapeDetail(page, url) {
 
 async function scrapeShoobCards() {
     let output;
-    let pageNum = 1;
+    let pageNum = 188;
     let totalCardsExtracted = 0;
     let failedCards = 0;
     let isFirstCard = true;
