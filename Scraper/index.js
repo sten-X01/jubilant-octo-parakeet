@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { once } = require('events');
 
-const SCRAPE_EVENTS = true;
+const SCRAPE_EVENTS = false;
 const BASE_URL = 'https://shoob.gg';
 const NORMAL_OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
 
