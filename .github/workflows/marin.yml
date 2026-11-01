@@ -42,32 +42,33 @@ jobs:
         echo "🧹 Clearing Disk Space..."
         sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
         sudo docker image prune --all --force
-    
+
         sudo apt-get update -qq
         sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate neofetch ttyd btop python3 python3-pip
-        
+
         # --- 📥 YT-DLP + JS RUNTIME FIX ---
         sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
         sudo chmod a+rx /usr/local/bin/yt-dlp
-        
+
         # Install Deno (yt-dlp preferred JS runtime)
         curl -fsSL https://deno.land/install.sh | sh
         sudo ln -s /home/runner/.deno/bin/deno /usr/local/bin/deno
 
     - name: 🍪 Create Cookies File
+      env:
+        YT_COOKIES: ${{ secrets.YT_COOKIES }}
       run: |
-        echo "${{ secrets.YT_COOKIES }}" > cookies.txt
-        # Isse file main root folder mein ban jayegi
-        
-        # 🛡️ INSTALL & DEEP CLEAN JUNK (Code 2 logic)
+        echo "$YT_COOKIES" > cookies.txt
+
+        # 🛡️ INSTALL & DEEP CLEAN JUNK
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
         sudo dpkg -i cloudflared-linux-amd64.deb
-        
-        # Ye command bot folder ke andar se bhi installer ko uda degi
+
         find . -name "cloudflared-linux-amd64.deb" -type f -delete
-        
+
         sudo npm install -g pm2
         curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | sudo bash
+        mkdir -p ~/.ssh
         ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 
     - name: 💾 Setup Ghost Auto-Save (savecode)
@@ -75,22 +76,22 @@ jobs:
         git config --global user.email "marin-bot@auto.sync"
         git config --global user.name "Marin Auto-Saver"
         git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
-        
+
         echo "**/node_modules/" >> .gitignore
         echo "**/*.log" >> .gitignore
         echo "filebrowser.db" >> .gitignore
-        
+
         mv .github /tmp/.github_hidden
-        
+
         echo '#!/bin/bash' > savecode
         echo 'echo "⏳ Saving ALL BOTS to GitHub..."' >> savecode
-        echo 'mv /tmp/.github_hidden ./.github' >> savecode 
+        echo 'mv /tmp/.github_hidden ./.github' >> savecode
         echo 'git add .' >> savecode
         echo 'git commit -m "💾 Auto-saved Multi-Bot Empire [skip ci]" || echo "No changes to save."' >> savecode
         echo 'git push origin HEAD || echo "⚠️ Push failed! Check PAT_TOKEN."' >> savecode
-        echo 'mv ./.github /tmp/.github_hidden' >> savecode 
+        echo 'mv ./.github /tmp/.github_hidden' >> savecode
         echo 'echo "✅ Save Process Completed for all bots!"' >> savecode
-        
+
         sudo mv savecode /usr/local/bin/savecode
         sudo chmod +x /usr/local/bin/savecode
 
@@ -109,26 +110,24 @@ jobs:
       run: |
         echo "🔍 Scanning for Bot Folders..."
         BOT_LIST=""
-        
+
         for dir in */ ; do
           if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
             BOT_NAME=$(basename "$dir")
-            
+
             if [ -z "$BOT_LIST" ]; then
               BOT_LIST="$BOT_NAME"
             else
               BOT_LIST="$BOT_LIST, $BOT_NAME"
             fi
-            
+
             echo "⚙️ Initializing Bot: $BOT_NAME"
             cd "$dir"
-            
-            # Use Bun for installation if specified in package.json engines
+
             if grep -q '"bun":' package.json; then
               echo "🥟 Bun detected, installing with Bun..."
               bun install
-              
-              # Start with smol engine if it is a main.js project
+
               if [ -f "src/main.js" ]; then
                 pm2 start "bun run --smol src/main.js" --name "$BOT_NAME"
               else
@@ -149,60 +148,73 @@ jobs:
         pm2 save
         echo "ACTIVE_BOTS=${BOT_LIST:-'No bots found!'}" >> $GITHUB_ENV
 
-    # --- 🌐 OPEN WEB PANELS SETUP (Code 2 Stability) ---
+    # --- 🌐 OPEN WEB PANELS SETUP ---
     - name: 🌐 Start Open Web Panels & Btop
       run: |
-        set +e 
-        
-        # 🛡️ ULTRA STABLE STARTUP
+        set +e
+
         filebrowser -a 0.0.0.0 -p 8080 -r . --noauth -d /tmp/filebrowser.db > /tmp/filebrowser.log 2>&1 &
         ttyd -R -p 61208 btop > /tmp/btop.log 2>&1 &
-        
-        # Give services enough time to breathe
+
         sleep 20
-        
+
         cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_file.log 2>&1 &
         cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_btop.log 2>&1 &
-        
-        # Extra time for tunnel mapping
+
         sleep 30
-        
+
         FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_file.log | head -n 1)
         BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_btop.log | head -n 1)
-        
+
         echo "FILE_MANAGER_URL=${FILE_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
 
-    # --- 🔄 TMATE SSH & OPEN ALERT ---
-    - name: 🔄 Start Tmate Loop & Discord Alert
+    # --- 🔍 TMATE DEBUG (temporary) ---
+    - name: 🔍 Tmate Debug
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       run: |
         set +e
-        cat >> ~/.bashrc << 'EOF'
-        export PS1='\[\033[01;32m\]VPS \[\033[01;34m\]❯ \[\033[00m\]'
-        EOF
 
+        echo "=== DNS ==="
+        getent hosts ssh.tmate.io || echo "DNS FAIL"
+
+        echo "=== PORT CHECK ==="
+        timeout 5 bash -c '</dev/tcp/ssh.tmate.io/22' && echo "22 OK" || echo "22 BLOCKED"
+        timeout 5 bash -c '</dev/tcp/ssh.tmate.io/443' && echo "443 OK" || echo "443 BLOCKED"
+
+        echo "=== TMATE ==="
         tmate -V
-        for i in {1..10}; do
-          tmate -S /tmp/tmate.sock kill-server 2>/dev/null
-          rm -f /tmp/tmate.sock
-          tmate -S /tmp/tmate.sock new-session -d
-          timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready
-          SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
-          echo "Attempt $i: $SSH_MSG"
+        tmate -S /tmp/tmate.sock kill-server 2>/dev/null
+        rm -f /tmp/tmate.sock
+        tmate -S /tmp/tmate.sock new-session -d
+        timeout 60 tmate -S /tmp/tmate.sock wait tmate-ready
+        echo "wait exit code: $?"
 
-          if [[ "$SSH_MSG" == *"tmate.io"* ]]; then
-            # yahan apna PAYLOAD + curl wala same code rakho
-            echo "RESTART_SAFE=true" >> $GITHUB_ENV
-            for m in {1..36}; do sleep 300; done
-            savecode || true
-            exit 0
-          fi
-          sleep 5
-        done
-        curl -H "Content-Type: application/json" -d '{"content": "❌ ERROR: Tmate failed."}' $DISCORD_WEBHOOK
-        exit 1
+        echo "=== MESSAGES ==="
+        tmate -S /tmp/tmate.sock show-messages
+
+        echo "=== SSH STRING ==="
+        SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
+        echo "$SSH_MSG"
+
+        # Agar SSH mil gaya to Discord pe bhej do
+        if [[ "$SSH_MSG" == *"tmate.io"* ]]; then
+          PAYLOAD=$(jq -n \
+            --arg ssh "$SSH_MSG" \
+            --arg fileUrl "$FILE_MANAGER_URL" \
+            --arg btopUrl "$BTOP_URL" \
+            --arg bots "$ACTIVE_BOTS" \
+            '{content: "✅ **VPS Online**\n🤖 Bots: `\($bots)`\n📂 Files: \($fileUrl)\n📊 Health: \($btopUrl)\n💻 SSH: `\($ssh)`\n\n💾 Save: `savecode`"}')
+          curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
+        fi
+
+        # Runner 30 min zinda rakho taaki bots + panels chalte rahein aur log padh sako.
+        # Jab debug khatam ho jaye to Cancel workflow kar do.
+        echo "RESTART_SAFE=true" >> $GITHUB_ENV
+        for m in {1..6}; do sleep 300; done
+        savecode || true
+        exit 0
 
     - name: 🧟 Respawn Zombie
       if: env.RESTART_SAFE == 'true'
