@@ -1,0 +1,863 @@
+name: Veldora
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+  # Optional self-heal (restarts the chain if it ever breaks): uncomment the next 2 lines
+  # schedule:
+  #   - cron: '0 */6 * * *'
+
+# cancel-in-progress is false: a new run waits for the current one to finish.
+# This prevents one bot session running twice and never cuts a final save short.
+concurrency:
+  group: vps
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  TZ: Asia/Kolkata
+  NODE_VERSION: '22'        # Node.js version
+  RUN_MINUTES: '340'        # length of one run (GitHub hard limit is 360 minutes)
+  AUTOSAVE_MINUTES: '30'    # save everything to GitHub every N minutes
+  STATUS_MINUTES: '5'       # refresh the Discord status message every N minutes
+  VPS_HOSTNAME: vps         # hostname and Tailscale device name
+  VPS_DISPLAY_USER: admin   # user name shown in the shell prompt
+  PANEL_USER: admin         # File Manager / System Monitor login name
+  # Preinstalled runner tools are removed to free disk space. List groups to KEEP, comma separated:
+  # java, go, rust, browsers, databases, devops, cloud, conda, docker-images, android, dotnet, ...
+  CLEANUP_KEEP: ''
+
+jobs:
+  ultimate-vps:
+    name: VPS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+
+    steps:
+    - name: 📂 Checkout
+      uses: actions/checkout@v6
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        fetch-depth: 1
+        persist-credentials: false   # the token is never written to .git/config
+
+    - name: 🧭 Init + Helper Commands
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      run: |
+          set +e
+          VPS_HOME="$HOME/.vps"; mkdir -p "$VPS_HOME/bin"
+          NOW=$(date +%s)
+
+          # ---- environment file (read by every script and every SSH session) ----
+          {
+            echo "export VPS_HOME=\"$VPS_HOME\""
+            echo "export VPS_DIR=\"/srv/bots\""
+            echo "export VPS_REAL_DIR=\"$GITHUB_WORKSPACE\""
+            echo "export VPS_HOSTNAME=\"$VPS_HOSTNAME\""
+            echo "export VPS_DISPLAY_USER=\"$VPS_DISPLAY_USER\""
+            echo "export TZ=Asia/Kolkata"
+            echo "export REPO=\"$GITHUB_REPOSITORY\""
+            echo "export BRANCH=\"$GITHUB_REF_NAME\""
+            echo "export RUN_NUMBER=\"$GITHUB_RUN_NUMBER\""
+            echo "export RUN_URL=\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\""
+            echo "export JOB_START=$NOW"
+            echo "export DEADLINE=$((NOW + RUN_MINUTES * 60))"
+            echo "export PANEL_USER=\"$PANEL_USER\""
+            echo "export AUTOSAVE_MINUTES=$AUTOSAVE_MINUTES"
+            echo "export STATUS_MINUTES=$STATUS_MINUTES"
+            echo 'export PATH="$VPS_HOME/bin:$PATH"'
+          } > "$VPS_HOME/env.sh"
+          {
+            printf 'export DISCORD_WEBHOOK=%q\n' "$DISCORD_WEBHOOK"
+            printf 'export PAT_TOKEN=%q\n' "$PAT_TOKEN"
+          } > "$VPS_HOME/secrets.env"
+          chmod 600 "$VPS_HOME/secrets.env"
+
+          # ---- helper commands ----
+          cat > "$VPS_HOME/lib.sh" <<'VPS_EOF'
+          # lib.sh - shared helpers (sourced by workflow steps)
+          VPS_HOME="${VPS_HOME:-$HOME/.vps}"
+
+          # supervise NAME 'command' : run in the background and restart it 3 seconds after any exit
+          supervise() {
+            local name="$1"; shift
+            setsid nohup bash -c "while true; do { $* ; } > \"$VPS_HOME/$name.log\" 2>&1; sleep 3; done" >/dev/null 2>&1 &
+          }
+
+          # get_url LOGNAME : print the trycloudflare URL found in a tunnel log (ignores api.* hosts)
+          get_url() {
+            grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' "$VPS_HOME/$1.log" 2>/dev/null | grep -v '^https://api\.' | head -n 1
+          }
+
+          # wait_url LOGNAME : wait up to 90 seconds for a tunnel URL
+          wait_url() {
+            local i u
+            for i in $(seq 1 45); do
+              u=$(get_url "$1"); [ -n "$u" ] && { echo "$u"; return; }
+              sleep 2
+            done
+          }
+
+          # write_urls FILE_MANAGER_URL MONITOR_URL
+          write_urls() {
+            printf 'export FB_CF_URL=%q\nexport BTOP_CF_URL=%q\n' "$1" "$2" > "$VPS_HOME/urls.env"
+          }
+          VPS_EOF
+
+          cat > "$VPS_HOME/bin/vps-notify" <<'VPS_EOF'
+          #!/bin/bash
+          # vps-notify - Discord notifier
+          #   vps-notify boot "stage"          boot progress (one message that keeps being edited)
+          #   vps-notify online                full status embed (create / edit)
+          #   vps-notify update                refresh the status embed
+          #   vps-notify offline "reason"      mark the status embed as offline
+          #   vps-notify event "title" "text" [green|red|yellow|blue|grey|pink]
+          VPS_HOME="${VPS_HOME:-$HOME/.vps}"
+          for f in env.sh secrets.env state.env urls.env; do [ -f "$VPS_HOME/$f" ] && . "$VPS_HOME/$f"; done
+          [ -f "$VPS_HOME/path.sh" ] && . "$VPS_HOME/path.sh"
+          [ -z "$DISCORD_WEBHOOK" ] && exit 0
+
+          color_of() {
+            case "$1" in
+              green) echo 5763719 ;; red) echo 15548997 ;; yellow) echo 16705372 ;;
+              blue) echo 5793266 ;; grey) echo 9807270 ;; *) echo 16738740 ;;
+            esac
+          }
+
+          field() { # name value [inline]
+            jq -n --arg n "$1" --arg v "$2" --argjson i "${3:-false}" \
+              '{name:$n, value:(if ($v|length)==0 then "-" else $v[0:1024] end), inline:$i}'
+          }
+
+          http_post()  { curl -s -m 25 -H 'Content-Type: application/json' -d "$1" "${DISCORD_WEBHOOK}?wait=true"; }
+          http_patch() { curl -s -m 25 -X PATCH -H 'Content-Type: application/json' -d "$1" "${DISCORD_WEBHOOK}/messages/$2"; }
+
+          send() { # payload (DRY_RUN=1 only prints the payload)
+            if [ -n "$DRY_RUN" ]; then echo "$1" | jq .; return; fi
+            http_post "$1" > /dev/null
+          }
+
+          send_main() { # payload -> edit the main status message, or create it
+            [ -n "$DRY_RUN" ] && { echo "$1" | jq .; return; }
+            local id res
+            id=$(cat "$VPS_HOME/msg_id" 2>/dev/null)
+            if [ -n "$id" ]; then
+              res=$(http_patch "$1" "$id")
+              if echo "$res" | jq -e '.id' > /dev/null 2>&1; then return 0; fi
+            fi
+            res=$(http_post "$1")
+            echo "$res" | jq -r '.id // empty' > "$VPS_HOME/msg_id"
+          }
+
+          bots_text() {
+            local out
+            out=$(pm2 jlist 2>/dev/null | sed -n '/^\[/,$p' | jq -r '.[] |
+              (if .pm2_env.status=="online" then "🟢" elif .pm2_env.status=="errored" then "🔴" else "🟡" end)
+              + " **" + .name + "** · " + .pm2_env.status
+              + " · " + (((.monit.memory // 0)/1048576)|floor|tostring) + " MB"
+              + " · ↻" + (.pm2_env.restart_time|tostring)' 2>/dev/null)
+            [ -z "$out" ] && out="_no bots running_"
+            printf '%s' "$out"
+          }
+
+          sys_text() {
+            local cores load mem disk up
+            cores=$(nproc 2>/dev/null)
+            load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+            mem=$(free -m 2>/dev/null | awk '/Mem/{printf "%.1f / %.1f GB", $3/1024, $2/1024}')
+            disk=$(df -h --output=used,size,avail / 2>/dev/null | awk 'NR==2{printf "%s / %s used · %s free", $1, $2, $3}')
+            up=$(uptime -p 2>/dev/null | sed 's/^up //')
+            printf '🧠 CPU load **%s** (%s cores)\n💾 RAM **%s**\n💽 Disk **%s**\n⏱️ Uptime **%s**' "$load" "$cores" "$mem" "$disk" "$up"
+          }
+
+          tools_text() {
+            local n b p d f y
+            n=$(node -v 2>/dev/null); b=$(bun -v 2>/dev/null)
+            p=$(python3 -V 2>&1 | awk '{print $2}')
+            d=$(deno --version 2>/dev/null | awk 'NR==1{print $2}')
+            f=$(ffmpeg -version 2>/dev/null | awk 'NR==1{print $3}')
+            y=$(yt-dlp --version 2>/dev/null)
+            printf 'Node `%s` · Bun `%s` · Python `%s`\nDeno `%s` · ffmpeg `%s` · yt-dlp `%s`' "${n:--}" "${b:--}" "${p:--}" "${d:--}" "${f:--}" "${y:--}"
+          }
+
+          footer() { printf 'VPS • Run #%s • %s' "${RUN_NUMBER:-?}" "$(TZ=Asia/Kolkata date '+%d %b %H:%M IST')"; }
+
+          status_embed() { # mode: online|offline  [reason]
+            local mode="$1" reason="$2" title desc col ssh fb bt save last fields
+
+            if [ "$mode" = "online" ]; then
+              title="🍁 VPS • Online"; col=$(color_of green)
+              desc="⏳ Session ends <t:${DEADLINE}:R> (<t:${DEADLINE}:t>)\n🚀 Started <t:${JOB_START}:R> • [Run #${RUN_NUMBER}](${RUN_URL})"
+            else
+              title="🌙 VPS • Offline"; col=$(color_of grey)
+              desc="${reason:-Session ended.}\n[Run #${RUN_NUMBER}](${RUN_URL})"
+            fi
+
+            if [ -n "$TS_IP" ]; then
+              ssh="\`ssh runner@${TS_HOST}\`\n\`ssh runner@${TS_IP}\`\n🔑 Password: \`SSH_PASSWORD\` secret\n_Tailscale must be ON on your device_"
+            else
+              ssh="⚠️ Tailscale did not connect. Check the \`TS_AUTHKEY\` secret."
+            fi
+
+            fb="👤 \`${PANEL_USER}\` · 🔑 ${PANEL_PASS_HINT:-SSH_PASSWORD}\n"
+            [ -n "$TS_IP" ]       && fb="${fb}🔒 http://${TS_IP}:8080\n"
+            [ -n "$FB_CF_URL" ]   && fb="${fb}🌐 ${FB_CF_URL}"
+            bt="👤 \`${PANEL_USER}\` · read-only\n"
+            [ -n "$TS_IP" ]       && bt="${bt}🔒 http://${TS_IP}:61208\n"
+            [ -n "$BTOP_CF_URL" ] && bt="${bt}🌐 ${BTOP_CF_URL}"
+
+            last=$(cat "$VPS_HOME/last_save" 2>/dev/null)
+            if [ -n "$last" ]; then save="Last: <t:${last}:R>"; else save="Not saved yet"; fi
+            save="${save}\nEvery ${AUTOSAVE_MINUTES:-30} min · \`savecode\`"
+
+            fields=$( {
+              field "🤖 Bots" "$(bots_text)" false
+              field "💻 SSH (Tailscale)" "$(printf '%b' "$ssh")" false
+              field "📂 File Manager" "$(printf '%b' "$fb")" true
+              field "📊 System Monitor" "$(printf '%b' "$bt")" true
+              field "⚙️ System" "$(sys_text)" false
+              field "🧰 Tools" "$(tools_text)" false
+              field "💾 Auto-Save" "$(printf '%b' "$save")" true
+              field "🛠️ Commands" '`vps-info` · `pm2 status` · `pm2 logs NAME`
+          `pm2 restart NAME` · `savecode`' true
+            } | jq -s . )
+
+            jq -n --arg title "$title" --arg desc "$(printf '%b' "$desc")" --argjson col "$col" \
+                  --argjson fields "$fields" --arg foot "$(footer)" \
+              '{username:"VPS", embeds:[{title:$title, description:$desc, color:$col, fields:$fields,
+                footer:{text:$foot}, timestamp:(now|floor|todate)}]}'
+          }
+
+          case "$1" in
+            boot)
+              echo "$2" >> "$VPS_HOME/boot.log"
+              lines=$(awk '{a[NR]=$0} END{for(i=1;i<NR;i++) print "✅ " a[i]; if(NR) print "⏳ " a[NR]}' "$VPS_HOME/boot.log")
+              send_main "$(jq -n --arg d "$lines" --arg foot "$(footer)" --argjson c "$(color_of yellow)" \
+                '{username:"VPS", embeds:[{title:"🔧 VPS • Starting...", description:$d, color:$c,
+                  footer:{text:$foot}, timestamp:(now|floor|todate)}]}')"
+              ;;
+            online|update) send_main "$(status_embed online)" ;;
+            offline)       send_main "$(status_embed offline "$2")" ;;
+            event)
+              send "$(jq -n --arg t "$2" --arg d "$(printf '%b' "$3")" --argjson c "$(color_of "${4:-pink}")" --arg foot "$(footer)" \
+                '{username:"VPS", embeds:[{title:$t, description:$d, color:$c, footer:{text:$foot},
+                  timestamp:(now|floor|todate)}]}')"
+              ;;
+            *) echo "usage: vps-notify boot|online|update|offline|event" ; exit 1 ;;
+          esac
+          VPS_EOF
+
+          cat > "$VPS_HOME/bin/savecode" <<'VPS_EOF'
+          #!/bin/bash
+          # savecode - push all bot files to GitHub (retries, size guard, lock)
+          #   savecode            save and show output
+          #   savecode --quiet    silent (used by auto-save)
+          #   savecode --notify   also post the result to Discord
+          VPS_HOME="${VPS_HOME:-$HOME/.vps}"
+          for f in env.sh secrets.env; do [ -f "$VPS_HOME/$f" ] && . "$VPS_HOME/$f"; done
+          [ -f "$VPS_HOME/path.sh" ] && . "$VPS_HOME/path.sh"
+
+          QUIET=0; NOTIFY=0
+          for a in "$@"; do
+            [ "$a" = "--quiet" ] && QUIET=1
+            [ "$a" = "--notify" ] && NOTIFY=1
+          done
+          say() { [ "$QUIET" = 1 ] || echo -e "$@"; }
+
+          cd "${VPS_DIR:-.}" || { echo "Bots directory not found"; exit 1; }
+
+          exec 9>/tmp/savecode.lock
+          flock -w 180 9 || { say "⏳ Another save is running, skipping."; exit 0; }
+
+          say "⏳ Saving all bots to GitHub..."
+
+          # GitHub rejects files over 100 MB, so skip anything above 95 MB
+          find . -path ./.git -prune -o -type f -size +95M -print 2>/dev/null | sed 's|^\./||' >> .git/info/exclude
+          sort -u .git/info/exclude -o .git/info/exclude
+
+          git add -A -- . ':!.github' 2>/dev/null
+
+          if git diff --cached --quiet; then
+            date +%s > "$VPS_HOME/last_save"
+            say "✅ Nothing new, everything is already saved."
+            [ "$NOTIFY" = 1 ] && vps-notify event "💾 Save" "Nothing new, everything is already saved." blue
+            exit 0
+          fi
+
+          FILES=$(git diff --cached --name-only | wc -l)
+          git commit -q -m "💾 Auto-save • $(TZ=Asia/Kolkata date '+%d %b %Y %H:%M IST') • run #${RUN_NUMBER:-0} [skip ci]" || exit 1
+
+          ok=0
+          for i in 1 2 3 4; do
+            if git push -q origin "HEAD:${BRANCH:-main}" 2>/tmp/savecode.err; then ok=1; break; fi
+            say "⚠️ Push failed (attempt $i), syncing and retrying..."
+            if ! git pull -q --rebase -X theirs origin "${BRANCH:-main}" 2>>/tmp/savecode.err; then
+              git rebase --abort 2>/dev/null
+              git fetch -q --unshallow 2>/dev/null
+            fi
+            sleep 3
+          done
+
+          if [ "$ok" = 1 ]; then
+            date +%s > "$VPS_HOME/last_save"
+            say "✅ Saved ($FILES files)."
+            [ "$NOTIFY" = 1 ] && vps-notify event "💾 Saved to GitHub" "$FILES files saved." green
+            exit 0
+          fi
+
+          say "❌ Push failed. Check PAT_TOKEN (needs repo access)."
+          vps-notify event "❌ Save failed" "Push failed 4 times. Check the \`PAT_TOKEN\` secret or a merge conflict.\n\`\`\`$(tail -n 3 /tmp/savecode.err | cut -c1-300)\`\`\`" red
+          exit 1
+          VPS_EOF
+
+          cat > "$VPS_HOME/bin/vps-info" <<'VPS_EOF'
+          #!/bin/bash
+          # vps-info - VPS dashboard (shown automatically on SSH login)
+          VPS_HOME="${VPS_HOME:-$HOME/.vps}"
+          for f in env.sh state.env urls.env; do [ -f "$VPS_HOME/$f" ] && . "$VPS_HOME/$f"; done
+          [ -f "$VPS_HOME/path.sh" ] && . "$VPS_HOME/path.sh"
+
+          R=$'\e[0m'; PK=$'\e[1;35m'; CY=$'\e[1;36m'; YL=$'\e[1;33m'; DM=$'\e[2m'
+          now=$(date +%s); left=$(( ${DEADLINE:-$now} - now )); [ "$left" -lt 0 ] && left=0
+          end=$(TZ=Asia/Kolkata date -d "@${DEADLINE:-$now}" '+%H:%M IST')
+          last=$(cat "$VPS_HOME/last_save" 2>/dev/null)
+          if [ -n "$last" ]; then lastv="$(( (now - last) / 60 )) min ago"; else lastv="not yet"; fi
+
+          echo
+          echo "${PK}  🍁 VPS Dashboard${R}  ${DM}run #${RUN_NUMBER:-?} • ${BRANCH:-main}${R}"
+          echo "${DM}  ─────────────────────────────────────────────${R}"
+          printf '  %s⏳ Session%s   %sh %sm left (ends %s)\n' "$YL" "$R" "$((left/3600))" "$(((left%3600)/60))" "$end"
+          printf '  %s💾 Last save%s %s  %s(auto-save every %s min)%s\n' "$YL" "$R" "$lastv" "$DM" "${AUTOSAVE_MINUTES:-30}" "$R"
+          printf '  %s🧠 CPU/RAM%s   load %s • %s\n' "$YL" "$R" "$(cut -d' ' -f1 /proc/loadavg)" "$(free -m | awk '/Mem/{printf "%.1f/%.1f GB", $3/1024, $2/1024}')"
+          printf '  %s💽 Disk%s      %s\n' "$YL" "$R" "$(df -h --output=used,size,avail / | awk 'NR==2{printf "%s / %s used · %s free", $1, $2, $3}')"
+          echo
+          echo "${CY}  🌐 Access${R}"
+          [ -n "$TS_IP" ] && echo "   📂 Files   http://${TS_IP}:8080   ${DM}(${PANEL_USER:-admin})${R}"
+          [ -n "$TS_IP" ] && echo "   📊 Monitor http://${TS_IP}:61208  ${DM}(${PANEL_USER:-admin})${R}"
+          [ -n "$FB_CF_URL" ]   && echo "   🌐 Files   ${FB_CF_URL}"
+          [ -n "$BTOP_CF_URL" ] && echo "   🌐 Monitor ${BTOP_CF_URL}"
+          echo
+          echo "${CY}  🤖 Bots${R}"
+          pm2 jlist 2>/dev/null | sed -n '/^\[/,$p' | jq -r '.[] | "   " + (if .pm2_env.status=="online" then "🟢" elif .pm2_env.status=="errored" then "🔴" else "🟡" end) + " " + .name + "  " + .pm2_env.status + "  " + (((.monit.memory // 0)/1048576)|floor|tostring) + " MB  ↻" + (.pm2_env.restart_time|tostring)' 2>/dev/null || echo "   (pm2 not found)"
+          echo
+          echo "${CY}  🛠️  Commands${R}"
+          echo "   pm2 status | pm2 logs NAME | pm2 restart NAME | pm2 stop NAME"
+          echo "   savecode ${DM}(save to GitHub)${R}   bd ${DM}(bots folder)${R}   vps-info ${DM}(this screen)${R}"
+          echo
+          VPS_EOF
+
+          cat > "$VPS_HOME/bin/git-cred" <<'VPS_EOF'
+          #!/bin/bash
+          # git credential helper: keeps the GitHub token out of .git/config
+          [ "$1" = "get" ] || exit 0
+          [ -f "$HOME/.vps/secrets.env" ] && . "$HOME/.vps/secrets.env"
+          echo "username=x-access-token"
+          echo "password=$PAT_TOKEN"
+          VPS_EOF
+          chmod +x "$VPS_HOME"/bin/*
+
+          # ---- git: identity, credential helper (token stays out of .git/config), junk excluded from saves ----
+          git config --global user.email "autosave@vps.local"
+          git config --global user.name "VPS Auto-Save"
+          git config --global --add safe.directory '*'
+          git config --global pull.rebase true
+          git config --global http.postBuffer 524288000
+          git config --global credential.helper "$VPS_HOME/bin/git-cred"
+          cat >> .git/info/exclude <<'VPS_EOF'
+          node_modules/
+          .venv/
+          venv/
+          __pycache__/
+          *.pyc
+          *.log
+          .cache/
+          .npm/
+          core.[0-9]*
+          VPS_EOF
+
+          . "$VPS_HOME/env.sh"
+          vps-notify boot "Runner ready (init + helper commands)"
+          exit 0
+
+    - name: 🧹 System Cleanup + Identity
+      run: |
+          set +e
+          . "$HOME/.vps/env.sh"
+          vps-notify boot "Cleaning up the system"
+
+          avail_mb() { df -BM --output=avail / | tail -n 1 | tr -dc '0-9'; }
+          BEFORE=$(avail_mb)
+
+          # CLEANUP_KEEP is a comma separated list of groups to keep (see the workflow header)
+          keep() { case ",${CLEANUP_KEEP// /}," in *",$1,"*) return 0 ;; esac; return 1; }
+          purge() { # group path...
+            local group="$1"; shift
+            keep "$group" && return 0
+            sudo rm -rf "$@" 2>/dev/null
+          }
+
+          # ---- remove preinstalled toolchains we do not need (in parallel) ----
+          purge dotnet     /usr/share/dotnet /usr/lib/dotnet "$HOME/.dotnet" &
+          purge android    /usr/local/lib/android /opt/android* &
+          purge haskell    /opt/ghc /usr/local/.ghcup "$HOME/.ghcup" &
+          purge codeql     /opt/hostedtoolcache/CodeQL &
+          purge boost      /usr/local/share/boost &
+          purge swift      /usr/share/swift &
+          purge julia      /usr/local/julia* &
+          purge java       /usr/lib/jvm /usr/share/gradle* /usr/share/maven* /usr/share/ant /usr/share/sbt /usr/local/graalvm &
+          purge rust       /usr/share/rust "$HOME/.rustup" "$HOME/.cargo" &
+          purge go         /usr/local/go "$HOME/go" &
+          purge cloud      /usr/lib/google-cloud-sdk /opt/az /usr/local/aws-cli /usr/local/aws-sam-cli /usr/local/sessionmanagerplugin /usr/local/lib/heroku &
+          purge powershell /usr/local/share/powershell /opt/microsoft/powershell &
+          purge conda      /usr/share/miniconda /usr/local/miniconda &
+          purge browsers   /opt/google/chrome /opt/microsoft/msedge /usr/local/share/chromium /usr/local/share/edge_driver /usr/local/share/gecko_driver /usr/lib/firefox /opt/firefox &
+          purge databases  /opt/mssql /opt/mssql-tools /opt/mssql-tools18 /usr/lib/postgresql /usr/share/postgresql /var/lib/postgresql /usr/share/mysql /var/lib/mysql &
+          purge devops     /usr/local/bin/kubectl /usr/local/bin/helm /usr/local/bin/minikube /usr/local/bin/kind /usr/local/bin/kustomize /usr/local/bin/terraform /usr/local/bin/packer /usr/local/bin/bicep /usr/local/bin/pulumi &
+          purge homebrew   /home/linuxbrew &
+          # every runtime we need is installed again by the setup steps below, so the whole tool cache can go
+          purge toolcache  /opt/hostedtoolcache/* &
+          # docs, man pages, old logs and package caches
+          purge docs       /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/help/* /etc/legal &
+          if ! keep docker-images; then
+            sudo docker system prune -af --volumes > /dev/null 2>&1 &
+          fi
+          wait
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/cache/debconf/*-old
+          sudo journalctl --rotate > /dev/null 2>&1; sudo journalctl --vacuum-size=20M > /dev/null 2>&1
+          sudo find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' -o -name '*.old' \) -delete 2>/dev/null
+          sudo find /var/log -type f -name '*.log' -exec truncate -s 0 {} + 2>/dev/null
+
+          AFTER=$(avail_mb)
+          FREED_GB=$(( (AFTER - BEFORE) / 1024 ))
+          echo "Disk cleanup freed ~${FREED_GB} GB, $((AFTER / 1024)) GB free"
+
+          # ---- identity: hostname, clean workspace path, quiet login ----
+          sudo hostnamectl set-hostname "$VPS_HOSTNAME" 2>/dev/null || sudo hostname "$VPS_HOSTNAME"
+          grep -q "127.0.1.1 $VPS_HOSTNAME" /etc/hosts || echo "127.0.1.1 $VPS_HOSTNAME" | sudo tee -a /etc/hosts > /dev/null
+
+          # expose the repository as /srv/bots, so no repository or runner name shows up in paths, prompts or process lists
+          sudo mkdir -p /srv/bots
+          if ! sudo mount --bind "$VPS_REAL_DIR" /srv/bots; then
+            sudo rmdir /srv/bots 2>/dev/null
+            sudo ln -sfn "$VPS_REAL_DIR" /srv/bots
+          fi
+          ls /srv/bots > /dev/null 2>&1 && echo "Bots directory: /srv/bots"
+
+          # no Ubuntu welcome text / last login lines, only our own dashboard
+          sudo chmod -x /etc/update-motd.d/* 2>/dev/null
+          : | sudo tee /etc/motd > /dev/null
+          touch "$HOME/.hushlogin"
+
+          vps-notify boot "System cleaned: freed ~${FREED_GB} GB (${AFTER} MB free)"
+          exit 0
+
+    - name: 🟢 Setup Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: 🥟 Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: ⚡ Restore Dependency Cache
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.npm
+          ~/.bun/install/cache
+          ~/.cache/pip
+          ~/.cache/uv
+        key: deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/bun.lock', '**/bun.lockb', '**/requirements.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-
+
+    - name: 🧰 System Tools + Runtimes
+      run: |
+          set +e
+          export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+          . "$HOME/.vps/env.sh"
+          VPS_HOME="$HOME/.vps"
+          vps-notify boot "Installing system tools and runtimes"
+
+          # ---- timezone, kernel tuning, swap ----
+          sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+          sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000 fs.inotify.max_user_watches=524288 > /dev/null 2>&1
+          if [ "$(swapon --show --noheadings | wc -l)" = "0" ]; then
+            sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile > /dev/null && sudo swapon /swapfile
+          fi
+
+          # ---- apt: essentials ----
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg imagemagick webp jq git curl wget unzip zip build-essential \
+            python3 python3-pip python3-venv openssh-server ttyd btop neofetch
+
+          # ---- apt: nice to have (one failure must not stop the rest) ----
+          for p in pipx p7zip-full tmux htop ncdu tree nano vim ripgrep fd-find fzf bat sqlite3 rsync lsof \
+                   net-tools dnsutils libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev \
+                   fonts-noto-color-emoji; do
+            sudo apt-get install -y -qq "$p" > /dev/null 2>&1 || echo "skipped: $p"
+          done
+
+          # ---- yt-dlp + Deno (JavaScript runtime) ----
+          sudo curl -fsSL --retry 3 https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          curl -fsSL https://deno.land/install.sh | sh > /dev/null 2>&1
+          sudo ln -sf "$HOME/.deno/bin/deno" /usr/local/bin/deno
+
+          # ---- cloudflared, filebrowser, tailscale ----
+          wget -q -O /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb > /dev/null 2>&1
+          rm -f /tmp/cloudflared.deb
+          curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | sudo bash > /dev/null 2>&1
+          curl -fsSL https://tailscale.com/install.sh | sh > /dev/null 2>&1
+
+          # ---- node globals (pm2, pnpm, yarn) and python tools (uv) ----
+          sudo env "PATH=$PATH" npm install -g pm2 pnpm yarn --no-fund --no-audit --loglevel=error
+          python3 -m pip install --user --break-system-packages -q uv 2>/dev/null
+
+          # ---- PATH, so SSH login shells also find node / bun / python / deno / pm2 ----
+          NODE_BIN=$(dirname "$(command -v node)")
+          BUN_BIN=$(dirname "$(command -v bun)")
+          {
+            echo "export PATH=\"$NODE_BIN:$BUN_BIN:\$HOME/.bun/bin:\$HOME/.deno/bin:\$HOME/.local/bin:\$PATH\""
+            echo 'export DENO_INSTALL="$HOME/.deno"'
+            echo 'export PIP_BREAK_SYSTEM_PACKAGES=1'
+            echo 'export PIP_DISABLE_PIP_VERSION_CHECK=1'
+          } > "$VPS_HOME/path.sh"
+          . "$VPS_HOME/path.sh"
+
+          # ---- shell setup: PATH + prompt + banner in every SSH session ----
+          # interactive extras (prompt, aliases, banner) live in shell.sh
+          cat > "$VPS_HOME/shell.sh" <<'VPS_EOF'
+          [ -f "$HOME/.vps/env.sh" ] && . "$HOME/.vps/env.sh"
+          [ -f "$HOME/.vps/path.sh" ] && . "$HOME/.vps/path.sh"
+          case $- in *i*) ;; *) return 0 ;; esac
+          export PS1='\[\e[1;32m\]'"${VPS_DISPLAY_USER:-admin}"'@'"${VPS_HOSTNAME:-vps}"'\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+          alias ll='ls -lah --color=auto'
+          alias bd='cd "$VPS_DIR"'
+          alias bots='pm2 status'
+          alias logs='pm2 logs'
+          alias fd='fdfind'
+          alias bat='batcat'
+          if [ -z "$VPS_BANNER" ]; then
+            export VPS_BANNER=1
+            [ "$PWD" = "$HOME" ] && cd "$VPS_DIR" 2>/dev/null
+            [ -n "$SSH_TTY" ] && vps-info
+          fi
+          VPS_EOF
+
+          # 1) ~/.bashrc: env/PATH on top (for non-interactive ssh commands), shell.sh at the end
+          {
+            echo '[ -f "$HOME/.vps/env.sh" ] && . "$HOME/.vps/env.sh"'
+            echo '[ -f "$HOME/.vps/path.sh" ] && . "$HOME/.vps/path.sh"'
+            cat "$HOME/.bashrc"
+            echo '[ -f "$HOME/.vps/shell.sh" ] && . "$HOME/.vps/shell.sh"'
+          } > /tmp/bashrc.new && mv /tmp/bashrc.new "$HOME/.bashrc"
+
+          # 2) login shells that never read ~/.bashrc: /etc/profile.d
+          echo "[ -f \"$HOME/.vps/shell.sh\" ] && . \"$HOME/.vps/shell.sh\"" | sudo tee /etc/profile.d/zz-vps.sh > /dev/null
+
+          # 3) /etc/environment: PATH for every SSH session (including non-interactive commands)
+          BIN_DIRS="$HOME/.vps/bin:$NODE_BIN:$BUN_BIN:$HOME/.bun/bin:$HOME/.deno/bin:$HOME/.local/bin"
+          if grep -q '^PATH="' /etc/environment; then
+            sudo sed -i "s|^PATH=\"|PATH=\"$BIN_DIRS:|" /etc/environment
+          else
+            echo "PATH=\"$BIN_DIRS:$PATH\"" | sudo tee -a /etc/environment > /dev/null
+          fi
+
+          # ---- GitHub CLI login (gh is already on the runner) ----
+          . "$VPS_HOME/secrets.env"
+          echo "$PAT_TOKEN" | gh auth login --with-token 2>/dev/null
+
+          # ---- free the space used by package caches ----
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+          echo "=== VERSIONS ==="
+          node -v; bun -v; python3 -V; deno --version | head -n 1; ffmpeg -version | head -n 1
+          yt-dlp --version; pm2 -v; tailscale version | head -n 1; filebrowser version; cloudflared --version
+          exit 0
+
+    - name: 🚀 Start All Bots (PM2)
+      run: |
+          set +e
+          . "$HOME/.vps/env.sh"; . "$HOME/.vps/path.sh"
+          vps-notify boot "Installing and starting bots"
+          ulimit -n 65535 2>/dev/null
+          cd "$VPS_DIR" || exit 1
+
+          PM2_OPTS="--time --restart-delay 3000"
+          BOT_LIST=""; FAILED=""
+
+          for dir in */ ; do
+            dir=${dir%/}
+            [ -f "$dir/.nobot" ] && continue
+            case "$dir" in node_modules|.github) continue ;; esac
+
+            if [ -f "$dir/package.json" ]; then
+              # ---------- Node / Bun bot ----------
+              BOT_LIST="${BOT_LIST:+$BOT_LIST, }$dir"
+              echo "Starting bot: $dir"
+              cd "$dir" || continue
+              if grep -q '"bun":' package.json; then
+                echo "  runtime: Bun"
+                bun install --silent || FAILED="$FAILED $dir"
+                if [ -f "src/main.js" ]; then
+                  pm2 start "bun run --smol src/main.js" --name "$dir" $PM2_OPTS
+                else
+                  pm2 start "bun start" --name "$dir" $PM2_OPTS
+                fi
+              else
+                echo "  runtime: Node"
+                npm install --no-audit --no-fund --loglevel=error || FAILED="$FAILED $dir"
+                if [ -f "index.js" ]; then
+                  pm2 start index.js --name "$dir" $PM2_OPTS
+                else
+                  pm2 start npm --name "$dir" $PM2_OPTS -- start
+                fi
+              fi
+              cd "$VPS_DIR" || exit 1
+
+            elif [ -f "$dir/requirements.txt" ]; then
+              # ---------- Python bot ----------
+              ENTRY=""
+              for f in main.py bot.py app.py run.py index.py; do
+                [ -f "$dir/$f" ] && { ENTRY="$f"; break; }
+              done
+              [ -z "$ENTRY" ] && continue
+              BOT_LIST="${BOT_LIST:+$BOT_LIST, }$dir"
+              echo "Starting bot: $dir (Python, $ENTRY)"
+              cd "$dir" || continue
+              python3 -m venv .venv && ./.venv/bin/pip install -q -r requirements.txt || FAILED="$FAILED $dir"
+              pm2 start "$ENTRY" --name "$dir" --interpreter "$PWD/.venv/bin/python" $PM2_OPTS
+              cd "$VPS_DIR" || exit 1
+            fi
+          done
+
+          # keep pm2 logs from growing forever
+          pm2 install pm2-logrotate > /dev/null 2>&1
+          pm2 set pm2-logrotate:max_size 20M > /dev/null 2>&1
+          pm2 set pm2-logrotate:retain 3 > /dev/null 2>&1
+          pm2 save
+
+          echo "Active bots: ${BOT_LIST:-none}"
+          if [ -n "$FAILED" ]; then
+            vps-notify event "⚠️ Dependency install failed" "Packages could not be installed for:\`$FAILED\`" yellow
+          fi
+          if [ -z "$BOT_LIST" ]; then
+            vps-notify event "ℹ️ No bots found" "No folder with a \`package.json\` or \`requirements.txt\` was found." blue
+          fi
+          exit 0
+
+    - name: 🌐 Network (SSH + Tailscale + Panels)
+      env:
+        TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+      run: |
+          set +e
+          . "$HOME/.vps/env.sh"; . "$HOME/.vps/path.sh"; . "$HOME/.vps/lib.sh"
+          VPS_HOME="$HOME/.vps"
+          vps-notify boot "Setting up network access (SSH, Tailscale, panels)"
+
+          # ---------- SSH server ----------
+          if [ -n "$SSH_PASSWORD" ]; then
+            echo "runner:$SSH_PASSWORD" | sudo chpasswd
+          else
+            vps-notify event "⚠️ SSH_PASSWORD is empty" "Password login will not work. Set the secret or use \`SSH_PUBKEY\`." yellow
+          fi
+          if [ -n "$SSH_PUBKEY" ]; then
+            mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            echo "$SSH_PUBKEY" >> "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
+          fi
+          sudo mkdir -p /run/sshd
+          printf '%s\n' 'PasswordAuthentication yes' 'PermitRootLogin no' 'AllowUsers runner' \
+            'PrintMotd no' 'PrintLastLog no' 'X11Forwarding no' \
+            'ClientAliveInterval 60' 'ClientAliveCountMax 10' 'MaxAuthTries 4' \
+            | sudo tee /etc/ssh/sshd_config.d/00-vps.conf > /dev/null
+          sudo service ssh restart || sudo /usr/sbin/sshd
+
+          # ---------- Tailscale ----------
+          TS_IP=""; TS_HOST=""
+          if [ -n "$TS_AUTHKEY" ]; then
+            sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$VPS_HOSTNAME" --accept-dns=false
+            for i in $(seq 1 15); do
+              TS_IP=$(tailscale ip -4 2>/dev/null | head -n 1); [ -n "$TS_IP" ] && break; sleep 2
+            done
+            TS_HOST=$(tailscale status --json 2>/dev/null | jq -r '.Self.HostName // empty')
+            tailscale status
+          else
+            vps-notify event "⚠️ TS_AUTHKEY is missing" "The Tailscale secret is not set, so SSH access is unavailable." yellow
+          fi
+
+          # ---------- Web panels (login required) ----------
+          # password priority: PANEL_PASSWORD secret > SSH_PASSWORD secret > random (File Browser needs 12+ characters)
+          if [ -n "$PANEL_PASSWORD" ]; then PANEL_PASS="$PANEL_PASSWORD"; PANEL_HINT="\`PANEL_PASSWORD\` secret"
+          else PANEL_PASS="$SSH_PASSWORD"; PANEL_HINT="\`SSH_PASSWORD\` secret"; fi
+
+          FBDB="$VPS_HOME/filebrowser.db"
+          filebrowser -d "$FBDB" config init > /dev/null 2>&1
+          # hide root level dotfiles (.git, .github, .gitignore ...) for every user: listing and direct links
+          HIDE_FLAG=""
+          if ! filebrowser -d "$FBDB" rules add '^/\.' --regex > /dev/null 2>&1; then
+            HIDE_FLAG="--hideDotfiles"
+          fi
+          if ! filebrowser -d "$FBDB" users add "$PANEL_USER" "$PANEL_PASS" --perm.admin $HIDE_FLAG > /dev/null 2>&1; then
+            PANEL_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+            filebrowser -d "$FBDB" users add "$PANEL_USER" "$PANEL_PASS" --perm.admin $HIDE_FLAG > /dev/null 2>&1
+            PANEL_HINT="\`$PANEL_PASS\` (auto-generated: the password secret is shorter than 12 characters)"
+          fi
+          export PANEL_PASS
+
+          supervise filebrowser 'filebrowser -a 0.0.0.0 -p 8080 -r "$VPS_DIR" -d "$VPS_HOME/filebrowser.db"'
+          supervise btop 'ttyd -p 61208 -c "$PANEL_USER:$PANEL_PASS" btop'
+          sleep 3
+          supervise cf_fb 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080'
+          supervise cf_btop 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:61208'
+
+          FB_URL=$(wait_url cf_fb)
+          BTOP_URL=$(wait_url cf_btop)
+          write_urls "$FB_URL" "$BTOP_URL"
+          echo "Files: ${FB_URL:-none} | Monitor: ${BTOP_URL:-none}"
+
+          {
+            printf 'export TS_IP=%q\n' "$TS_IP"
+            printf 'export TS_HOST=%q\n' "${TS_HOST:-$VPS_HOSTNAME}"
+            printf 'export PANEL_PASS_HINT=%q\n' "$PANEL_HINT"
+          } > "$VPS_HOME/state.env"
+          exit 0
+
+    - name: 💚 Go Online + Keep-Alive
+      env:
+        TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      run: |
+          set +e
+          . "$HOME/.vps/env.sh"; . "$HOME/.vps/path.sh"; . "$HOME/.vps/lib.sh"
+          . "$VPS_HOME/state.env"
+
+          vps-notify online
+          echo "RESTART_SAFE=true" >> "$GITHUB_ENV"
+          vps-info
+
+          light_cleanup() {
+            sudo journalctl --vacuum-size=50M > /dev/null 2>&1
+            sudo find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' \) -delete 2>/dev/null
+            sudo find /var/log -type f -name '*.log' -size +50M -exec truncate -s 0 {} + 2>/dev/null
+            sudo apt-get clean > /dev/null 2>&1
+          }
+
+          NOW=$(date +%s); T_SAVE=$NOW; T_UPD=$NOW; T_YT=$NOW; T_CLEAN=$NOW; T_DISK=0
+          declare -A NOTIFIED
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 30
+            NOW=$(date +%s)
+
+            # --- Tailscale / sshd watchdog ---
+            if [ -n "$TS_AUTHKEY" ] && [ -z "$(tailscale ip -4 2>/dev/null | head -n 1)" ]; then
+              sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$VPS_HOSTNAME" --accept-dns=false > /dev/null 2>&1
+            fi
+            pgrep -x sshd > /dev/null || sudo service ssh start > /dev/null 2>&1
+
+            # --- did a Cloudflare URL change? ---
+            . "$VPS_HOME/urls.env"
+            NF=$(get_url cf_fb); NB=$(get_url cf_btop)
+            if { [ -n "$NF" ] && [ "$NF" != "$FB_CF_URL" ]; } || { [ -n "$NB" ] && [ "$NB" != "$BTOP_CF_URL" ]; }; then
+              write_urls "${NF:-$FB_CF_URL}" "${NB:-$BTOP_CF_URL}"
+              vps-notify event "🌐 Public URL changed" "The new File Manager / Monitor link is in the status message." blue
+              vps-notify update
+              T_UPD=$NOW
+            fi
+
+            # --- crashed (errored) bots ---
+            ERRORED=$(pm2 jlist 2>/dev/null | sed -n '/^\[/,$p' | jq -r '.[] | select(.pm2_env.status=="errored") | .name' 2>/dev/null)
+            for b in $ERRORED; do
+              if [ $(( NOW - ${NOTIFIED[$b]:-0} )) -gt 600 ]; then
+                pm2 restart "$b" > /dev/null 2>&1
+                vps-notify event "🔴 Bot crashed" "\`$b\` was in an errored state and has been restarted.\nLogs: \`pm2 logs $b\`" red
+                NOTIFIED[$b]=$NOW
+              fi
+            done
+
+            # --- auto-save ---
+            if [ $(( NOW - T_SAVE )) -ge $(( AUTOSAVE_MINUTES * 60 )) ]; then
+              savecode --quiet
+              T_SAVE=$NOW
+            fi
+
+            # --- live status message refresh ---
+            if [ $(( NOW - T_UPD )) -ge $(( STATUS_MINUTES * 60 )) ]; then
+              vps-notify update
+              T_UPD=$NOW
+            fi
+
+            # --- hourly: light cleanup + low disk warning ---
+            if [ $(( NOW - T_CLEAN )) -ge 3600 ]; then
+              light_cleanup
+              T_CLEAN=$NOW
+            fi
+            FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+            if [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt 5 ] && [ $(( NOW - T_DISK )) -gt 3600 ]; then
+              vps-notify event "⚠️ Low disk space" "Only ${FREE_GB} GB free. Delete large files or caches." yellow
+              T_DISK=$NOW
+            fi
+
+            # --- yt-dlp self-update every 3 hours ---
+            if [ $(( NOW - T_YT )) -ge 10800 ]; then
+              sudo yt-dlp -U > /dev/null 2>&1
+              T_YT=$NOW
+            fi
+          done
+          echo "Session time is over."
+          exit 0
+
+    - name: 💾 Final Save + Shutdown
+      if: always()
+      env:
+        JOB_STATUS: ${{ job.status }}
+      run: |
+          set +e
+          [ -f "$HOME/.vps/env.sh" ] || exit 0
+          . "$HOME/.vps/env.sh"; . "$HOME/.vps/path.sh"
+          [ -f "$VPS_HOME/state.env" ] && . "$VPS_HOME/state.env"
+          [ -f "$VPS_HOME/urls.env" ] && . "$VPS_HOME/urls.env"
+
+          vps-notify event "⏰ Session ending" "Stopping bots and running the final save..." yellow
+          pm2 stop all > /dev/null 2>&1
+          sleep 3
+          savecode --notify
+
+          if [ "$JOB_STATUS" = "cancelled" ]; then
+            R="🛑 The workflow was cancelled. It will not restart automatically."
+          elif [ "$RESTART_SAFE" = "true" ]; then
+            R="🔁 A new run starts automatically (back online in about 5 minutes)."
+          else
+            R="⚠️ The run failed during setup. Check the Actions logs."
+          fi
+          vps-notify offline "$R"
+          sudo tailscale logout > /dev/null 2>&1
+          exit 0
+
+    - name: 🔁 Respawn Next Run
+      if: ${{ !cancelled() && env.RESTART_SAFE == 'true' }}
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ secrets.PAT_TOKEN }}
+        script: |
+          const wf = process.env.GITHUB_WORKFLOW_REF.split('@')[0].split('/').pop();
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: wf,
+            ref: process.env.GITHUB_REF_NAME
+          });
