@@ -1,3 +1,4 @@
+
 const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const fs = require('fs');
@@ -7,7 +8,8 @@ const { once } = require('events');
 const BASE_URL = 'https://shoob.gg';
 const OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
 
-const CONCURRENCY = 15;
+const CONCURRENCY = 10;
+const PAGES_PER_SESSION = 10;
 const PAGE_TIMEOUT = 35000;
 const SELECTOR_TIMEOUT = 12000;
 const MAX_RETRIES = 3;
@@ -42,6 +44,21 @@ async function optimizePage(page) {
             return;
         }
         request.continue().catch(() => {});
+    });
+}
+
+async function launchBrowser() {
+    return puppeteer.launch({
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-background-networking',
+            '--disable-extensions',
+            '--disable-sync',
+            '--disable-default-apps'
+        ]
     });
 }
 
@@ -196,17 +213,18 @@ async function scrapeDetail(page, url) {
 }
 
 async function scrapeShoobCards() {
-    let browser;
     let output;
     let pageNum = 1;
     let totalCardsExtracted = 0;
     let failedCards = 0;
     let isFirstCard = true;
+    let finished = false;
 
     console.log('\n======================================');
     console.log('Shoob.gg Optimized Scraper');
     console.log('======================================');
     console.log(`Concurrency: ${CONCURRENCY}`);
+    console.log(`Browser Recycling: Every ${PAGES_PER_SESSION} Pages`);
     console.log('Duplicate filtering: DISABLED');
     console.log('Incomplete card filtering: DISABLED');
     console.log('Media downloads: DISABLED');
@@ -217,119 +235,152 @@ async function scrapeShoobCards() {
         await once(output, 'open');
         await writeStream(output, '[\n');
 
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-background-networking',
-                '--disable-extensions',
-                '--disable-sync',
-                '--disable-default-apps'
-            ]
-        });
-
-        const listPage = await browser.newPage();
-        await optimizePage(listPage);
-
-        const workers = [];
-
-        for (let i = 0; i < CONCURRENCY; i++) {
-            const page = await browser.newPage();
-            await optimizePage(page);
-            workers.push(page);
-        }
-
-        while (true) {
-            const pageUrl = `${BASE_URL}/cards?page=${pageNum}`;
-            console.log(`\n[PAGE ${pageNum}] ${pageUrl}`);
-
-            let cardLinks = [];
+        while (!finished) {
+            let browser;
+            let sessionPagesCompleted = 0;
 
             try {
-                await listPage.goto(pageUrl, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: PAGE_TIMEOUT
-                });
+                console.log('\n======================================');
+                console.log(`STARTING NEW BROWSER SESSION`);
+                console.log(`Starting Page: ${pageNum}`);
+                console.log(`Maximum Pages: ${PAGES_PER_SESSION}`);
+                console.log('======================================\n');
 
-                await listPage.waitForSelector(
-                    'a[href*="/cards/info/"]',
-                    { timeout: SELECTOR_TIMEOUT }
-                );
+                browser = await launchBrowser();
 
-                const $ = cheerio.load(await listPage.content());
+                const listPage = await browser.newPage();
+                await optimizePage(listPage);
 
-                $('a[href*="/cards/info/"]').each((i, el) => {
-                    const href = $(el).attr('href');
-                    if (href) {
-                        const url = absoluteUrl(href);
-                        if (url) cardLinks.push(url);
-                    }
-                });
-            } catch (error) {
-                console.error(`[PAGE ERROR] ${error.message}`);
-                break;
-            }
+                const workers = [];
 
-            if (!cardLinks.length) {
-                console.log('No more card links found.');
-                break;
-            }
-
-            console.log(`Found ${cardLinks.length} card links.`);
-
-            let nextIndex = 0;
-
-            const workerTasks = workers.map(async (page, workerId) => {
-                while (true) {
-                    const currentIndex = nextIndex++;
-                    if (currentIndex >= cardLinks.length) break;
-
-                    const url = cardLinks[currentIndex];
-                    const card = await scrapeDetail(page, url);
-
-                    if (card.extractionFailed) failedCards++;
-
-                    const json = JSON.stringify(card, null, 2);
-
-                    await writeStream(
-                        output,
-                        (isFirstCard ? '' : ',\n') + json
-                    );
-
-                    isFirstCard = false;
-                    totalCardsExtracted++;
-
-                    console.log(
-                        `[WORKER ${workerId + 1}] Saved: ${totalCardsExtracted} | ${card.cardName || url}`
-                    );
+                for (let i = 0; i < CONCURRENCY; i++) {
+                    const page = await browser.newPage();
+                    await optimizePage(page);
+                    workers.push(page);
                 }
-            });
 
-            await Promise.all(workerTasks);
+                while (
+                    sessionPagesCompleted < PAGES_PER_SESSION &&
+                    !finished
+                ) {
+                    const pageUrl = `${BASE_URL}/cards?page=${pageNum}`;
+                    console.log(`\n[PAGE ${pageNum}] ${pageUrl}`);
 
-            console.log(`\n[PAGE ${pageNum}] Completed`);
-            console.log(`Saved: ${totalCardsExtracted}`);
-            console.log(`Failed: ${failedCards}`);
+                    let cardLinks = [];
 
-            pageNum++;
+                    try {
+                        await listPage.goto(pageUrl, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: PAGE_TIMEOUT
+                        });
+
+                        await listPage.waitForSelector(
+                            'a[href*="/cards/info/"]',
+                            { timeout: SELECTOR_TIMEOUT }
+                        );
+
+                        const $ = cheerio.load(await listPage.content());
+
+                        $('a[href*="/cards/info/"]').each((i, el) => {
+                            const href = $(el).attr('href');
+                            if (href) {
+                                const url = absoluteUrl(href);
+                                if (url) cardLinks.push(url);
+                            }
+                        });
+                    } catch (error) {
+                        console.error(`[PAGE ERROR] ${error.message}`);
+                        finished = true;
+                        break;
+                    }
+
+                    if (!cardLinks.length) {
+                        console.log('No more card links found.');
+                        finished = true;
+                        break;
+                    }
+
+                    console.log(`Found ${cardLinks.length} card links.`);
+
+                    let nextIndex = 0;
+
+                    const workerTasks = workers.map(async (page, workerId) => {
+                        while (true) {
+                            const currentIndex = nextIndex++;
+                            if (currentIndex >= cardLinks.length) break;
+
+                            const url = cardLinks[currentIndex];
+
+                            try {
+                                const card = await scrapeDetail(page, url);
+
+                                if (card.extractionFailed) failedCards++;
+
+                                const json = JSON.stringify(card, null, 2);
+
+                                await writeStream(
+                                    output,
+                                    (isFirstCard ? '' : ',\n') + json
+                                );
+
+                                isFirstCard = false;
+                                totalCardsExtracted++;
+
+                                console.log(
+                                    `[WORKER ${workerId + 1}] Saved: ${totalCardsExtracted} | ${card.cardName || url}`
+                                );
+                            } catch (error) {
+                                failedCards++;
+                                console.error(
+                                    `[WORKER ${workerId + 1} ERROR] ${url}: ${error.message}`
+                                );
+                            }
+                        }
+                    });
+
+                    await Promise.all(workerTasks);
+
+                    console.log(`\n[PAGE ${pageNum}] Completed`);
+                    console.log(`Saved: ${totalCardsExtracted}`);
+                    console.log(`Failed: ${failedCards}`);
+
+                    pageNum++;
+                    sessionPagesCompleted++;
+                }
+            } finally {
+                if (browser) {
+                    console.log('\n======================================');
+                    console.log('CLOSING BROWSER SESSION');
+                    console.log(`Pages Completed: ${sessionPagesCompleted}`);
+                    console.log(`Next Page: ${pageNum}`);
+                    console.log('======================================');
+
+                    await browser.close().catch(error => {
+                        console.error('Browser close error:', error.message);
+                    });
+
+                    browser = null;
+                }
+            }
+
+            if (!finished && sessionPagesCompleted === PAGES_PER_SESSION) {
+                console.log('\n======================================');
+                console.log('BROWSER RECYCLED SUCCESSFULLY');
+                console.log(`Completed Through Page: ${pageNum - 1}`);
+                console.log(`Resuming From Page: ${pageNum}`);
+                console.log('Launching Fresh Chromium...');
+                console.log('======================================\n');
+            }
         }
     } catch (error) {
         console.error('\n[FATAL ERROR]', error);
     } finally {
-        if (browser) {
-            await browser.close().catch(error => {
-                console.error('Browser close error:', error.message);
-            });
-        }
-
         if (output) {
             try {
                 await writeStream(output, '\n]\n');
-                const finished = once(output, 'finish');
+                const finishedEvent = once(output, 'finish');
                 output.end();
-                await finished;
+                await finishedEvent;
             } catch (error) {
                 console.error('Output write error:', error.message);
                 output.destroy();
@@ -341,6 +392,7 @@ async function scrapeShoobCards() {
         console.log('======================================');
         console.log(`Total entries: ${totalCardsExtracted}`);
         console.log(`Failed extractions: ${failedCards}`);
+        console.log(`Last page reached: ${pageNum}`);
         console.log(`Output: ${OUTPUT_FILE}`);
         console.log('Duplicate filtering: OFF');
         console.log('======================================\n');
