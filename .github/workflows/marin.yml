@@ -169,18 +169,12 @@ jobs:
         echo "FILE_MANAGER_URL=${FILE_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
         echo "BTOP_URL=${BTOP_URL:-'⚠️ Wait & Refresh'}" >> $GITHUB_ENV
 
-    # --- 🔌 REAL SSH (works from any terminal, no client install) ---
-    - name: 🔌 SSH Tunnel (Pinggy + Bore) & Discord Alert
+    # --- 🔌 SSH VIA CLOUDFLARED ---
+    - name: 🔌 SSH via Cloudflared & Discord Alert
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
       run: |
         set +e
-
-        echo "=== DNS CHECK ==="
-        for h in github.com a.pinggy.io bore.pub; do
-          getent hosts $h > /dev/null && echo "$h OK" || echo "$h DNS FAIL"
-        done
 
         # --- sshd with password login ---
         sudo apt-get install -y -qq openssh-server
@@ -191,74 +185,45 @@ jobs:
         sleep 2
         sudo ss -tlnp | grep ':22 ' && echo "sshd listening on 22" || echo "sshd NOT listening"
 
-        # --- Tunnel 1: Pinggy (plain ssh via tcp tunnel, auto-reconnect) ---
+        # --- Cloudflared SSH tunnel (auto-reconnect) ---
         (
           while true; do
-            sleep infinity | ssh -T -p 443 -R0:localhost:22 \
-              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
-              tcp@a.pinggy.io > /tmp/pinggy.log 2>&1
+            cloudflared tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf_ssh.log 2>&1
             sleep 3
           done
         ) &
 
-        # --- Tunnel 2: Bore (plain ssh via bore.pub, auto-reconnect) ---
-        BORE_URL=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest \
-          | jq -r '.assets[].browser_download_url' | grep 'x86_64-unknown-linux-musl.tar.gz$' | head -n 1)
-        if [ -n "$BORE_URL" ]; then
-          curl -sL "$BORE_URL" | tar -xz -C /tmp
-          sudo mv /tmp/bore /usr/local/bin/bore
-          (
-            while true; do
-              bore local 22 --to bore.pub > /tmp/bore.log 2>&1
-              sleep 3
-            done
-          ) &
-        else
-          echo "bore download failed" > /tmp/bore.log
-        fi
-
         sleep 25
-        echo "=== PINGGY LOG ==="; cat /tmp/pinggy.log
-        echo "=== BORE LOG ===";   cat /tmp/bore.log
+        echo "=== CF SSH LOG ==="; tail -n 30 /tmp/cf_ssh.log
 
-        get_pinggy() {
-          sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log 2>/dev/null | grep -o 'tcp://[^ ]*' | tail -n 1 | sed 's#tcp://##'
-        }
-        get_bore() {
-          sed 's/\x1b\[[0-9;]*m//g' /tmp/bore.log 2>/dev/null | grep -o 'bore\.pub:[0-9]*' | tail -n 1
+        get_host() {
+          grep -o '[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_ssh.log 2>/dev/null | tail -n 1
         }
 
         send_alert() {
-          P="$1"; B="$2"
-          MSG="✅ **VPS Online**\n🤖 Bots: \`$ACTIVE_BOTS\`\n📂 Files: $FILE_MANAGER_URL\n📊 Health: $BTOP_URL\n\n💻 **SSH (user: runner, pass: SSH_PASSWORD secret)**"
-          if [ -n "$P" ]; then
-            PH=${P%%:*}; PP=${P##*:}
-            MSG="$MSG\n1️⃣ Pinggy: \`ssh runner@$PH -p $PP\`"
+          H="$1"
+          if [ -n "$H" ]; then
+            MSG="✅ **VPS Online**\n🤖 Bots: \`$ACTIVE_BOTS\`\n📂 Files: $FILE_MANAGER_URL\n📊 Health: $BTOP_URL\n\n💻 **SSH** (user: runner, pass: SSH_PASSWORD secret)\n\`ssh -o ProxyCommand=\"cloudflared access ssh --hostname $H\" runner@$H\`\n\n💾 Save: \`savecode\` (session khatam hone se pehle)"
+          else
+            MSG="⚠️ Cloudflared SSH URL nahi mila. Workflow logs check karo."
           fi
-          if [ -n "$B" ]; then
-            BH=${B%%:*}; BP=${B##*:}
-            MSG="$MSG\n2️⃣ Bore: \`ssh runner@$BH -p $BP\`"
-          fi
-          [ -z "$P$B" ] && MSG="$MSG\n⚠️ Koi tunnel URL nahi mila, logs check karo."
-          MSG="$MSG\n\n💾 Save: \`savecode\` (session khatam hone se pehle)"
           PAYLOAD=$(jq -n --arg c "$(printf '%b' "$MSG")" '{content: $c}')
           curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
         }
 
-        LAST_P=$(get_pinggy); LAST_B=$(get_bore)
-        echo "Pinggy: ${LAST_P:-none} | Bore: ${LAST_B:-none}"
-        send_alert "$LAST_P" "$LAST_B"
+        LAST=$(get_host)
+        echo "SSH host: ${LAST:-none}"
+        send_alert "$LAST"
 
         echo "RESTART_SAFE=true" >> $GITHUB_ENV
 
-        # ~3 hours; URL change (Pinggy free tunnel ~60 min pe expire hota hai) to naya alert bhejo
+        # ~3 hours; agar tunnel restart hua aur host badla to naya alert
         for m in {1..180}; do
           sleep 60
-          NP=$(get_pinggy); NB=$(get_bore)
-          if [ "$NP" != "$LAST_P" ] || [ "$NB" != "$LAST_B" ]; then
-            LAST_P="$NP"; LAST_B="$NB"
-            send_alert "$LAST_P" "$LAST_B"
+          NOW=$(get_host)
+          if [ -n "$NOW" ] && [ "$NOW" != "$LAST" ]; then
+            LAST="$NOW"
+            send_alert "$LAST"
           fi
         done
 
