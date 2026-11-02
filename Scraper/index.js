@@ -8,7 +8,7 @@ const SCRAPE_EVENTS = false;
 const BASE_URL = 'https://shoob.gg';
 const NORMAL_OUTPUT_FILE = path.join(__dirname, 'Shoob-Cards.json');
 
-const CONCURRENCY = 5;
+const CONCURRENCY = 10;
 const PAGES_PER_SESSION = 10;
 const PAGE_TIMEOUT = 45000;
 const SELECTOR_TIMEOUT = 15000;
