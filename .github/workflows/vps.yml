@@ -724,11 +724,14 @@ jobs:
           sleep 3
           supervise cf_fb 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080'
           supervise cf_btop 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:61208'
+          supervise cf_moviebox 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8081'
 
           FB_URL=$(wait_url cf_fb)
           BTOP_URL=$(wait_url cf_btop)
+          MOVIE_URL=$(wait_url cf_moviebox)
           write_urls "$FB_URL" "$BTOP_URL"
-          echo "Files: ${FB_URL:-none} | Monitor: ${BTOP_URL:-none}"
+          echo "Files: ${FB_URL:-none} | Monitor: ${BTOP_URL:-none} | MovieBox: ${MOVIE_URL:-none}"
+          echo "export MOVIE_CF_URL=\"$MOVIE_URL\"" >> "$VPS_HOME/urls.env"
 
           {
             printf 'export TS_IP=%q\n' "$TS_IP"
