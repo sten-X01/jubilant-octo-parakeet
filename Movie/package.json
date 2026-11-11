@@ -1,7 +1,0 @@
-{
-  "name": "moviebox-web",
-  "version": "1.0.0",
-  "scripts": {
-    "start": "bash run.sh"
-  }
-}
