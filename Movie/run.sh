@@ -1,16 +1,19 @@
 #!/bin/bash
 
-# 1. Official installation (Jo tumne terminal me test kiya aur working hai)
-echo "Installing MovieBox-TUI via official script..."
-curl -sSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash
+# 1. Clone the MovieBox-Web repository (if not already there)
+if [ ! -d "MovieBox-Web" ]; then
+    git clone https://github.com/ifallertzia/ifallhub.git MovieBox-Web
+fi
+cd MovieBox-Web
 
-# 2. PATH fix (Kyunki install script binary ko ~/.local/bin ya /usr/local/bin me daalta hai)
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+# 2. Start the Rust Backend API (Port 8787)
+# This handles the scraping, subtitles, and stream resolution
+cargo run --release -- --web-api &
 
-# 3. Terminal UI ke liye proper environment variables set karna
-export TERM=xterm-256color
-export COLORTERM=truecolor
+# 3. Start the Web Frontend (Port 8081)
+cd web
+npm install
 
-# 4. ttyd ko bash wrapper ke through start karna taaki app crash na ho
-echo "Starting MovieBox-TUI Web Interface on Port 8081..."
-ttyd -p 8081 -W bash -c "moviebox-tui"
+# Provide the API URL so the frontend knows where to get data
+export MOVIEBOX_API_URL=http://127.0.0.1:8787
+npm run dev -- -p 8081
